@@ -27,11 +27,15 @@ writeFileSync(configPath, JSON.stringify(config, undefined, 2) + '\n')
 
 const cargoPath = join(ROOT, 'src-tauri', 'Cargo.toml')
 const cargo = readFileSync(cargoPath, 'utf8')
-const next = cargo.replace(/^version = "[^"]+"$/m, `version = "${version}"`)
-if (next === cargo) {
+// \r? tolerates CRLF checkouts (Windows git autocrlf). Presence is judged by
+// the regex, not by the replace changing the text: re-running the script for
+// the version already in the manifest is a no-op, not an error.
+const versionLine = /^version = "[^"]+"\r?$/m
+if (!versionLine.test(cargo)) {
   console.error(`set-version: no version line found in ${cargoPath}`)
   process.exit(1)
 }
+const next = cargo.replace(versionLine, `version = "${version}"`)
 writeFileSync(cargoPath, next)
 
 console.log(`set-version: ${version}`)
