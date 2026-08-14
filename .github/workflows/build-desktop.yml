@@ -148,7 +148,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
-            librsvg2-dev patchelf libgtk-3-dev rpm
+            librsvg2-dev patchelf libgtk-3-dev rpm file desktop-file-utils
+          sudo apt-get install -y libfuse2 || sudo apt-get install -y libfuse2t64 || true
 
       - name: Stage the dsh payload (npm + Node runtime)
         run: npm run stage -- --version ${{ needs.detect.outputs.version }}
@@ -166,58 +167,31 @@ jobs:
         if: matrix.target == 'x86_64-pc-windows-msvc'
         run: node scripts/set-version.mjs ${{ needs.detect.outputs.version }} --msi-compatible
 
-      - name: Normalize updater signing key
-        id: signing
+      - name: Prepare updater signing key
         shell: bash
         env:
           RAW_SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           RAW_SIGNING_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-
-          key="${RAW_SIGNING_KEY:-}"
-          passphrase="${RAW_SIGNING_PASSWORD:-}"
-
-          if [ -z "$key" ] || [ -z "$passphrase" ]; then
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          if printf '%s' "$key" | grep -q '\\n'; then
-            key="$(printf '%b' "$key")"
-          fi
-
-          if ! printf '%s' "$key" | grep -q '^untrusted comment:'; then
-            decoded="$(printf '%s' "$key" | base64 --decode 2>/dev/null || true)"
-            if printf '%s' "$decoded" | grep -q '^untrusted comment:'; then
-              key="$decoded"
-            fi
-          fi
-
-          if ! printf '%s' "$key" | grep -q '^untrusted comment:'; then
-            echo "::warning::TAURI_SIGNING_PRIVATE_KEY is present but not a valid minisign secret key. Skipping updater signing for this run."
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          echo "enabled=true" >> "$GITHUB_OUTPUT"
-          {
-            echo "private_key<<EOF"
-            printf '%s\n' "$key"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-          echo "private_key_password=$passphrase" >> "$GITHUB_OUTPUT"
+          node scripts/prepare-updater-key.mjs --self-test
+          node scripts/prepare-updater-key.mjs
 
       - name: Build and bundle
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Signing is optional: when the secrets are absent, tauri-action
-          # skips updater signatures and the release carries unsigned bundles.
-          TAURI_SIGNING_PRIVATE_KEY: ${{ steps.signing.outputs.private_key }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ steps.signing.outputs.private_key_password }}
+          # Signing keys are exported via GITHUB_ENV as a file path (Tauri
+          # accepts a path or the base64 blob). Do not pass them through
+          # GITHUB_OUTPUT: multiline secrets get masked/emptied and tauri
+          # then fails with "Missing comment in secret key".
+          # linuxdeploy is itself an AppImage; GitHub's Ubuntu 24.04 runners
+          # cannot FUSE-mount, and its bundled strip rejects ELF .relr.dyn.
+          APPIMAGE_EXTRACT_AND_RUN: '1'
+          NO_STRIP: 'true'
         with:
           releaseId: ${{ needs.create-release.outputs.release-id }}
           releaseDraft: false
           prerelease: ${{ needs.detect.outputs.prerelease }}
+          args: ${{ matrix.target == 'x86_64-unknown-linux-gnu' && '--verbose' || '' }}
           tauriScript: npx --yes @tauri-apps/cli@^2
