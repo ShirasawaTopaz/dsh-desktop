@@ -1,0 +1,275 @@
+use std::fs::{create_dir_all, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
+
+use rand::rngs::OsRng;
+use rand::RngCore;
+use regex::Regex;
+use tauri_plugin_shell::process::{CommandChild, CommandEvent};
+use tauri_plugin_shell::ShellExt;
+use tauri::{AppHandle, Manager, Url, WebviewWindow};
+
+use crate::AppState;
+
+/// The dsh sidecar process plus shutdown coordination.
+pub struct Sidecar {
+    /// The child process handle (kill fallback); taken on kill.
+    pub child: Option<CommandChild>,
+    /// The loopback port from the readiness line, once seen.
+    pub port: Option<u16>,
+    /// Per-launch shutdown token, mirrored to the child via env.
+    pub token: String,
+    /// Fires once the child process terminates (std channel, recv_timeout-able).
+    pub exited: Receiver<()>,
+}
+
+/// How long the shell waits for the `dsh web:` readiness line.
+pub(crate) const READINESS_TIMEOUT: Duration = Duration::from_secs(60);
+/// Timeout for the shutdown-route HTTP call.
+pub(crate) const SHUTDOWN_ROUTE_TIMEOUT: Duration = Duration::from_secs(3);
+/// Grace after a successful route request before the kill fallback.
+pub(crate) const GRACE_AFTER_ROUTE: Duration = Duration::from_secs(8);
+
+fn append_log(path: &Path, line: &str) {
+    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+    let _ = writeln!(file, "{line}");
+}
+
+/// Only the app's own asset protocol (loading/error pages) and loopback
+/// origins may load in the window. The dsh GUI lives on the loopback server;
+/// anything else is blocked.
+pub fn is_allowed_navigation(url: &Url) -> bool {
+    match url.scheme() {
+        "tauri" => true,
+        "http" | "https" => matches!(
+            url.host_str(),
+            Some("127.0.0.1") | Some("localhost") | Some("[::1]")
+        ),
+        _ => false,
+    }
+}
+
+/// Parse the dsh web readiness line, returning the loopback port.
+pub fn readiness_port(line: &str) -> Option<u16> {
+    let captures = Regex::new(r"dsh web: http://127\.0\.0\.1:(\d+)")
+        .expect("static readiness regex")
+        .captures(line)?;
+    captures.get(1)?.as_str().parse::<u16>().ok()
+}
+
+fn random_hex(bytes: usize) -> String {
+    let mut buf = vec![0u8; bytes];
+    OsRng.fill_bytes(&mut buf);
+    buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Pump sidecar output into the log, detect the readiness line, and report
+/// termination (with an error page when the process dies unexpectedly). The
+/// event receiver is a tokio channel, so the pump owns a minimal runtime.
+async fn pump_events(
+    mut rx: tokio::sync::mpsc::Receiver<CommandEvent>,
+    ready_tx: Sender<u16>,
+    exited_tx: Sender<()>,
+    log_path: PathBuf,
+    window: WebviewWindow,
+    shutting_down: Arc<AtomicBool>,
+) {
+    let mut pending = String::new();
+    while let Some(event) = rx.recv().await {
+        match event {
+            CommandEvent::Stdout(bytes) => {
+                let text = String::from_utf8_lossy(&bytes);
+                append_log(&log_path, format!("[stdout] {text}").trim_end());
+                pending.push_str(&text);
+                while let Some(idx) = pending.find('\n') {
+                    let line = pending[..idx].to_string();
+                    pending.drain(..=idx);
+                    if let Some(port) = readiness_port(&line) {
+                        let _ = ready_tx.send(port);
+                    }
+                }
+            }
+            CommandEvent::Stderr(bytes) => {
+                let text = String::from_utf8_lossy(&bytes);
+                append_log(&log_path, format!("[stderr] {text}").trim_end());
+            }
+            CommandEvent::Error(error) => {
+                append_log(&log_path, &format!("[error] {error}"));
+                break;
+            }
+            CommandEvent::Terminated(payload) => {
+                append_log(
+                    &log_path,
+                    &format!("[exit] code={:?} signal={:?}", payload.code, payload.signal),
+                );
+                if !shutting_down.load(Ordering::Relaxed) && payload.code != Some(0) {
+                    let _ = window.navigate(
+                        Url::parse("tauri://localhost/error.html").expect("static asset url"),
+                    );
+                }
+                let _ = exited_tx.send(());
+                break;
+            }
+            // CommandEvent is non-exhaustive; future variants stay logged.
+            _ => {}
+        }
+    }
+}
+
+/// Spawn the dsh web sidecar, write the generated patch overlay, and arm the
+/// readiness watcher that navigates the window to the served GUI.
+pub fn spawn(
+    app: &AppHandle,
+    window: WebviewWindow,
+    state: Arc<AppState>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let resource_dir = app.path().resource_dir()?;
+    let dsh_dir = resource_dir.join("dsh");
+    let config_dir = app.path().app_config_dir()?;
+    create_dir_all(&config_dir)?;
+
+    // The wrapper patch overlay: regenerated at every launch so the plugin's
+    // absolute file:// URL always matches this installation (the app bundle
+    // can be moved after install).
+    let plugin_url = Url::from_file_path(resource_dir.join("tauri-shutdown.mjs"))
+        .map_err(|()| "resource path is not absolute".to_string())?;
+    let patch_path = config_dir.join("tauri-shutdown.patch.yml");
+    std::fs::write(
+        &patch_path,
+        format!(
+            "# Generated by dsh-desktop at launch; do not edit.\n\
+             - insert:\n\
+             \x20   - id: tauri-shutdown\n\
+             \x20     name: '{plugin_url}'\n",
+        ),
+    )?;
+
+    let token = random_hex(32);
+    let (ready_tx, ready_rx) = channel();
+    let (exited_tx, exited_rx) = channel();
+
+    let (rx, child) = app
+        .shell()
+        .sidecar("node")?
+        .args([
+            "node_modules/@deepseek-ai/dsh/lib/bin.js",
+            "--patch",
+            patch_path.to_str().unwrap_or_default(),
+            "--profile",
+            "web",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "0",
+        ])
+        .current_dir(&dsh_dir)
+        .env("DSH_TELEMETRY_DISABLED", "1")
+        .env("DSH_TAURI_SHUTDOWN_TOKEN", &token)
+        .spawn()?;
+
+    let log_dir = match app.path().home_dir() {
+        Ok(home) => home.join(".dsh").join("logs"),
+        Err(_) => config_dir.join("logs"),
+    };
+    create_dir_all(&log_dir)?;
+    let log_path = log_dir.join(format!("dsh-desktop-{}.log", std::process::id()));
+
+    let pump_log = log_path.clone();
+    thread::spawn({
+        let window = window.clone();
+        let shutting_down = state.shutting_down.clone();
+        move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("sidecar event runtime");
+            runtime.block_on(pump_events(
+                rx,
+                ready_tx,
+                exited_tx,
+                pump_log,
+                window,
+                shutting_down,
+            ));
+        }
+    });
+
+    *state.sidecar.lock().expect("sidecar lock") = Some(Sidecar {
+        child: Some(child),
+        port: None,
+        token,
+        exited: exited_rx,
+    });
+
+    // Readiness watcher: navigate once the URL line appears.
+    let watcher_log = log_path.clone();
+    thread::spawn(move || {
+        let shutting_down = state.shutting_down.clone();
+        match ready_rx.recv_timeout(READINESS_TIMEOUT) {
+            Ok(port) => {
+                if shutting_down.load(Ordering::Relaxed) {
+                    return;
+                }
+                if let Some(sidecar) = state.sidecar.lock().expect("sidecar lock").as_mut() {
+                    sidecar.port = Some(port);
+                }
+                let url = Url::parse(&format!("http://127.0.0.1:{port}")).expect("loopback url");
+                if let Err(error) = window.navigate(url) {
+                    append_log(&watcher_log, &format!("[shell] navigate failed: {error}"));
+                }
+            }
+            Err(_) => {
+                if !shutting_down.load(Ordering::Relaxed) {
+                    let _ = window.navigate(
+                        Url::parse("tauri://localhost/error.html").expect("static asset url"),
+                    );
+                }
+            }
+        }
+    });
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn readiness_line_parses_the_port() {
+        assert_eq!(readiness_port("dsh web: http://127.0.0.1:63082"), Some(63082));
+        assert_eq!(readiness_port("dsh web: http://127.0.0.1:0"), Some(0));
+        assert_eq!(readiness_port("dsh web: http://127.0.0.1:99999"), None);
+        assert_eq!(readiness_port("dsh web: http://0.0.0.0:3080"), None);
+        assert_eq!(readiness_port("something else"), None);
+    }
+
+    #[test]
+    fn navigation_guard_allows_only_loopback_and_app_assets() {
+        let ok = [
+            "http://127.0.0.1:63082/",
+            "http://localhost:3080/",
+            "https://[::1]:3080/",
+            "tauri://localhost/index.html",
+            "tauri://localhost/error.html",
+        ];
+        for url in ok {
+            assert!(is_allowed_navigation(&Url::parse(url).unwrap()), "{url}");
+        }
+        let blocked = [
+            "https://example.com/",
+            "http://192.168.1.10:3080/",
+            "file:///C:/Windows/notepad.exe",
+            "data:text/html,<h1>x</h1>",
+        ];
+        for url in blocked {
+            assert!(!is_allowed_navigation(&Url::parse(url).unwrap()), "{url}");
+        }
+    }
+}

@@ -1,0 +1,176 @@
+# Build the dsh desktop wrapper for the latest upstream deepseek-harness
+# release and publish installers + updater artifacts to a GitHub Release.
+#
+# Triggers:
+#   - schedule: poll the npm registry (@deepseek-ai/dsh dist-tags) and, as a
+#     fallback, the upstream dsh-v* git tags; skip versions already released
+#     here (dedupe key: this repo's `dsh-<version>` release tag);
+#   - workflow_dispatch: manual build of `auto` (latest) or an explicit version;
+#   - repository_dispatch (types: dsh-release): instant trigger once upstream
+#     opts in by dispatching with client_payload.version.
+#
+# Platform matrix (v1): Windows x64, macOS arm64, Linux x64. Each job stages
+# the exact upstream npm payload for its own platform (optional platform
+# dependencies like the Landlock addon resolve natively), smokes it, then
+# builds the Tauri bundle and uploads to the shared release.
+
+name: Build desktop wrapper
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Upstream dsh version to build (e.g. 0.1.0-rc.6), or "auto" for the latest'
+        required: true
+        default: auto
+  schedule:
+    # Daily poll at 02:00 UTC; the npm-registry check is cheap and the
+    # dedupe key (existing dsh-<version> release) makes re-runs no-ops.
+    - cron: '0 2 * * *'
+  repository_dispatch:
+    types: [dsh-release]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: desktop-build
+  cancel-in-progress: false
+
+env:
+  PRIMARY_NODE_VERSION: '24'
+  # Exact Node runtime embedded as the sidecar; must satisfy dsh's engines
+  # (^22.19.0 || >=24.0.0). Bump deliberately, in lockstep with the workflow.
+  NODE_RUNTIME_VERSION: '24.13.0'
+
+jobs:
+  detect:
+    name: Resolve upstream version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+      skip: ${{ steps.resolve.outputs.skip }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.PRIMARY_NODE_VERSION }}
+
+      - name: Resolve version and dedupe
+        id: resolve
+        env:
+          REQUESTED: ${{ inputs.version || 'auto' }}
+          DISPATCH_VERSION: ${{ github.event.client_payload.version }}
+        run: |
+          set -euo pipefail
+          if [ "$REQUESTED" != "auto" ]; then
+            VERSION="$REQUESTED"
+          elif [ -n "${DISPATCH_VERSION:-}" ]; then
+            VERSION="$DISPATCH_VERSION"
+          else
+            VERSION="$(node scripts/detect-version.mjs | sed -n 's/^version=//p')"
+          fi
+          node -e "process.exit(/^\\d+\\.\\d+\\.\\d+(-[0-9A-Za-z.-]+)?$/.test(process.argv[1]) ? 0 : 1)" "$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if gh release view "dsh-$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Release dsh-$VERSION already exists; nothing to build."
+            exit 0
+          fi
+          case "$VERSION" in
+            *-*) echo "prerelease=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+  create-release:
+    name: Create release
+    needs: detect
+    if: needs.detect.outputs.skip != 'true'
+    runs-on: ubuntu-24.04
+    outputs:
+      release-id: ${{ steps.create.outputs.id }}
+    steps:
+      - name: Create empty release
+        id: create
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: dsh-${{ needs.detect.outputs.version }}
+          name: DeepSeek Harness desktop ${{ needs.detect.outputs.version }}
+          body: |
+            Tauri 桌面封装,内嵌上游 [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) `${{ needs.detect.outputs.version }}` 的 Web GUI 与 Node.js 运行时。
+
+            - 上游版本:[`dsh-v${{ needs.detect.outputs.version }}`](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v${{ needs.detect.outputs.version }})
+            - Node 运行时:${{ env.NODE_RUNTIME_VERSION }}
+            - 数据目录:`~/.dsh`(与 dsh CLI 互通)
+            - 日志:`~/.dsh/logs/dsh-desktop-*.log`
+
+            安装后首次启动会展示系统打开提示(未签名构建);详见仓库 README 的签名说明。
+          draft: false
+          prerelease: ${{ needs.detect.outputs.prerelease }}
+          fail_on_unmatched_files: true
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: [detect, create-release]
+    if: needs.detect.outputs.skip != 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+          - target: aarch64-apple-darwin
+            runner: macos-14
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.PRIMARY_NODE_VERSION }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install Linux webkit deps
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev patchelf libgtk-3-dev rpm
+
+      - name: Stage the dsh payload (npm + Node runtime)
+        run: npm run stage -- --version ${{ needs.detect.outputs.version }}
+        env:
+          DSH_NODE_VERSION: ${{ env.NODE_RUNTIME_VERSION }}
+
+      - name: Smoke the staged payload
+        run: npm run smoke
+
+      - name: Write the build version
+        run: node scripts/set-version.mjs ${{ needs.detect.outputs.version }}
+
+      - name: Build and bundle
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Signing is optional: when the secrets are absent, tauri-action
+          # skips updater signatures and the release carries unsigned bundles.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          releaseId: ${{ needs.create-release.outputs.release-id }}
+          releaseDraft: false
+          prerelease: ${{ needs.detect.outputs.prerelease }}
+          tauriScript: npx --yes @tauri-apps/cli@^2

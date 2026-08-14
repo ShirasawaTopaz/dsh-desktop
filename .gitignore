@@ -1,0 +1,9 @@
+node_modules/
+.npm-cache/
+staging/
+resources/dsh/
+src-tauri/binaries/
+src-tauri/target/
+*.log
+.DS_Store
+target/

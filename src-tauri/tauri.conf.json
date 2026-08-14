@@ -1,0 +1,46 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "DeepSeek Harness",
+  "version": "0.1.0-rc.6",
+  "identifier": "com.deepseek-ai.dsh-desktop",
+  "build": {
+    "frontendDist": "../resources/loading"
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "DeveloperTool",
+    "shortDescription": "DeepSeek Harness 桌面版",
+    "longDescription": "DeepSeek Harness 的 Tauri 桌面封装:内置 dsh Web 界面与 Node.js 运行时。",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": {
+      "../resources/dsh": "dsh",
+      "../resources/tauri-shutdown.mjs": "tauri-shutdown.mjs",
+      "../resources/version.json": "version.json"
+    },
+    "externalBin": [
+      "binaries/node"
+    ],
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDYwNkE3ODQ2MTNGRjczNjcKUldSbmMvOFRSbmhxWUUwUlpBaXBjZVMvWUZISzhyNjNDRStVRXhmTlJlTnNnSDgrdnpEOVlRRnQK",
+      "endpoints": [
+        "https://github.com/ShirasawaTopaz/dsh-desktop/releases/latest/download/latest.json"
+      ]
+    }
+  }
+}

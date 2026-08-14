@@ -1,0 +1,17 @@
+{
+  "name": "dsh-desktop",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Tauri desktop wrapper for the DeepSeek Harness web GUI (dsh).",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "stage": "node scripts/stage-dsh.mjs",
+    "smoke": "node scripts/smoke.mjs",
+    "detect-version": "node scripts/detect-version.mjs",
+    "tauri": "tauri"
+  }
+}
