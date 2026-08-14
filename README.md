@@ -41,7 +41,7 @@ cd src-tauri && npx --yes @tauri-apps/cli@^2 build
 
 1. **定时轮询**(每天一次,02:00 UTC):npm registry `@deepseek-ai/dsh` 的 dist-tags(`latest` + `next`,上游 rc 版发布到 `next`),GitHub tags(`dsh-v*`)兜底;已在本仓库发布过 `dsh-<版本>` Release 的版本自动跳过;
 2. **手动触发**:`workflow_dispatch`,输入 `auto` 或具体版本;
-3. **repository_dispatch**(预留):上游 publish 后即时通知,需上游维护者配合。
+3. **repository_dispatch**(预留)。
 
 构建矩阵:Windows x64(NSIS+MSI)、macOS arm64(dmg)、Linux x64(AppImage+deb)。每个平台先组装、冒烟,再经 `tauri-action` 构建并上传到同一 Release。
 
