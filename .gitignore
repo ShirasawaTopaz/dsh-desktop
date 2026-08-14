@@ -7,5 +7,3 @@ src-tauri/target/
 *.log
 .DS_Store
 target/
-.ci-tauri-updater.key
-.ci-tauri-updater.password

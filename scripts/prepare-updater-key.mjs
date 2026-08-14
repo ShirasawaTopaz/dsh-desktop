@@ -2,73 +2,50 @@
 /**
  * Prepare the Tauri updater signing key for CI.
  *
- * `tauri build` always base64-decodes `TAURI_SIGNING_PRIVATE_KEY` (or the
- * contents of the file it points at). The GitHub secret may be stored either
- * as that base64 blob, or as the raw minisign key (`untrusted comment:` …).
- *
- * Passing the raw minisign form yields:
+ * `tauri build` always base64-decodes `TAURI_SIGNING_PRIVATE_KEY`. The GitHub
+ * secret may be stored either as that base64 blob, or as the raw minisign key
+ * (`untrusted comment:` …). Passing the raw form yields:
  *
  *   failed to decode base64 key: Invalid symbol 32, offset 9
  *
- * (`untrusted comment:` has a space at index 9.) Passing a Windows path
- * through `GITHUB_ENV` is also unreliable: backslashes can be eaten, `exists()`
- * then fails, and Tauri base64-decodes the path string instead.
+ * (`untrusted comment:` has a space at index 9.)
  *
- * This script normalizes to the single-line base64 form and writes it to a
- * file. `--exec` loads that file and runs the Tauri CLI, so the CLI only ever
- * sees a one-line base64 blob (safe for cmd.exe). An absent key disables
- * `bundle.createUpdaterArtifacts` so the build can still produce unsigned
- * installers.
+ * This script normalizes to a single-line base64 blob and exports it through
+ * `GITHUB_ENV` as `NAME=value` (not a file path: Windows backslashes in
+ * `GITHUB_ENV` get eaten, `exists()` fails, and Tauri then decodes the path).
+ * An absent key disables `bundle.createUpdaterArtifacts` so the build can
+ * still produce unsigned installers.
  *
  * Usage:
- *   node scripts/prepare-updater-key.mjs [--key-out <path>] [--password-out <path>]
+ *   node scripts/prepare-updater-key.mjs [--config <tauri.conf.json>]
  *   node scripts/prepare-updater-key.mjs --self-test
- *   node scripts/prepare-updater-key.mjs --exec [tauri cli args...]
- *
- * Defaults (GitHub Actions): `$GITHUB_WORKSPACE/.ci-tauri-updater.key`.
  *
  * Reads `RAW_SIGNING_KEY` / `RAW_SIGNING_PASSWORD` from the environment.
  */
 
-import { spawn } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { appendFileSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url))
 const DEFAULT_CONFIG = join(ROOT, 'src-tauri', 'tauri.conf.json')
-const DEFAULT_DIR = process.env.GITHUB_WORKSPACE || ROOT
-const DEFAULT_KEY_OUT = join(DEFAULT_DIR, '.ci-tauri-updater.key')
-const DEFAULT_PASSWORD_OUT = join(DEFAULT_DIR, '.ci-tauri-updater.password')
-const TAURI_NPM_SPEC = '@tauri-apps/cli@^2'
 
 function usage() {
   console.error(
-    'usage: node scripts/prepare-updater-key.mjs [--key-out <path>] [--password-out <path>] [--config <tauri.conf.json>]\n' +
-      '       node scripts/prepare-updater-key.mjs --self-test\n' +
-      '       node scripts/prepare-updater-key.mjs --exec [tauri cli args...]',
+    'usage: node scripts/prepare-updater-key.mjs [--config <tauri.conf.json>]\n' +
+      '       node scripts/prepare-updater-key.mjs --self-test',
   )
   process.exit(2)
 }
 
 function parseArgs(argv) {
-  const args = {
-    keyOut: DEFAULT_KEY_OUT,
-    passwordOut: DEFAULT_PASSWORD_OUT,
-    config: DEFAULT_CONFIG,
-    selfTest: false,
-    exec: null,
-  }
+  const args = { config: DEFAULT_CONFIG, selfTest: false }
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i]
-    if (arg === '--key-out') args.keyOut = argv[++i]
-    else if (arg === '--password-out') args.passwordOut = argv[++i]
-    else if (arg === '--config') args.config = argv[++i]
+    if (arg === '--config') args.config = argv[++i]
     else if (arg === '--self-test') args.selfTest = true
-    else if (arg === '--exec') {
-      args.exec = argv.slice(i + 1)
-      break
-    } else usage()
+    else usage()
   }
   return args
 }
@@ -144,91 +121,18 @@ function disableUpdaterArtifacts(configPath) {
   console.log(`prepare-updater-key: no signing key; disabled createUpdaterArtifacts in ${configPath}`)
 }
 
-function writeSecretFile(path, value) {
-  mkdirSync(dirname(path), { recursive: true })
-  writeFileSync(path, value)
-}
-
-function firstExistingFile(paths) {
-  for (const path of paths) {
-    if (path && existsSync(path)) return path
+/**
+ * Export a single-line value via `GITHUB_ENV`. Never use a heredoc here: the
+ * extra newline would be part of the value, and Tauri would fail base64
+ * padding. Never export a Windows path: `\` in `GITHUB_ENV` is unreliable.
+ */
+function appendGitHubEnv(name, value) {
+  const envFile = process.env.GITHUB_ENV
+  if (envFile === undefined || envFile === '') return
+  if (value.includes('\n') || value.includes('\r') || value.includes('\0')) {
+    throw new Error(`${name} must be a single line to export via GITHUB_ENV`)
   }
-  return undefined
-}
-
-function applySigningEnv(args) {
-  const keyFile = firstExistingFile([
-    process.env.TAURI_UPDATER_KEY_FILE,
-    args.keyOut,
-    DEFAULT_KEY_OUT,
-  ])
-  const passwordFile = firstExistingFile([
-    process.env.TAURI_UPDATER_PASSWORD_FILE,
-    args.passwordOut,
-    DEFAULT_PASSWORD_OUT,
-  ])
-
-  let rawKey = ''
-  if (keyFile !== undefined) rawKey = readFileSync(keyFile, 'utf8')
-  else if (process.env.TAURI_SIGNING_PRIVATE_KEY) rawKey = process.env.TAURI_SIGNING_PRIVATE_KEY
-  else if (process.env.RAW_SIGNING_KEY) rawKey = process.env.RAW_SIGNING_KEY
-
-  let rawPassword = ''
-  if (passwordFile !== undefined) rawPassword = readFileSync(passwordFile, 'utf8')
-  else if (process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD !== undefined) {
-    rawPassword = process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD
-  } else if (process.env.RAW_SIGNING_PASSWORD !== undefined) {
-    rawPassword = process.env.RAW_SIGNING_PASSWORD
-  }
-
-  if (rawKey.trim() === '') {
-    delete process.env.TAURI_SIGNING_PRIVATE_KEY
-    delete process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD
-    console.log('prepare-updater-key: --exec with no signing key')
-    return
-  }
-
-  const key = normalizePrivateKey(rawKey)
-  const password = normalizePassword(rawPassword)
-  if (key.includes(' ') || key.includes('\n') || key.includes('\r')) {
-    throw new Error('normalized signing key is not a single-line base64 blob')
-  }
-  process.env.TAURI_SIGNING_PRIVATE_KEY = key
-  process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD = password
-  const source = keyFile !== undefined ? `file ${keyFile}` : 'environment'
-  console.log(`prepare-updater-key: --exec using ${source} (${key.length} bytes, base64)`)
-}
-
-function quoteCmdArg(value) {
-  if (/^[\w@./:=+-]+$/.test(value)) return value
-  return `"${String(value).replace(/"/g, '""')}"`
-}
-
-function execTauri(args) {
-  applySigningEnv(args)
-  const isWin = process.platform === 'win32'
-  // cmd.exe treats `^` as an escape; quote the npm spec. Pass a single command
-  // string so Node does not warn on `shell: true` + args (DEP0190).
-  const child = isWin
-    ? spawn(
-        ['npx', '--yes', quoteCmdArg(TAURI_NPM_SPEC), ...args.exec.map(quoteCmdArg)].join(' '),
-        { stdio: 'inherit', env: process.env, shell: true },
-      )
-    : spawn('npx', ['--yes', TAURI_NPM_SPEC, ...args.exec], {
-        stdio: 'inherit',
-        env: process.env,
-      })
-  child.on('error', (error) => {
-    console.error(`prepare-updater-key: failed to spawn tauri cli: ${error.message}`)
-    process.exit(1)
-  })
-  child.on('exit', (code, signal) => {
-    if (signal) {
-      process.kill(process.pid, signal)
-      return
-    }
-    process.exit(code ?? 1)
-  })
+  appendFileSync(envFile, `${name}=${value}\n`)
 }
 
 function selfTest() {
@@ -250,7 +154,7 @@ function selfTest() {
     ['escaped', fromEscaped],
     ['flattened', fromFlattened],
   ]) {
-    if (value.includes(' ') || value.includes('\n')) {
+    if (value.includes(' ') || value.includes('\n') || value.includes('\r')) {
       throw new Error(`${label}: normalized key still has whitespace`)
     }
     const roundTrip = Buffer.from(value, 'base64').toString('utf8')
@@ -259,6 +163,24 @@ function selfTest() {
   }
   if (normalizePassword('secret\n\n') !== 'secret') throw new Error('password trim failed')
   if (normalizePassword('') !== '') throw new Error('empty password should stay empty')
+
+  const envFile = join(tmpdir(), `dsh-github-env-${process.pid}.env`)
+  writeFileSync(envFile, '')
+  const previousEnv = process.env.GITHUB_ENV
+  process.env.GITHUB_ENV = envFile
+  try {
+    appendGitHubEnv('TAURI_SIGNING_PRIVATE_KEY', fromBase64)
+    appendGitHubEnv('TAURI_SIGNING_PRIVATE_KEY_PASSWORD', 'secret')
+    const body = readFileSync(envFile, 'utf8')
+    const expected =
+      `TAURI_SIGNING_PRIVATE_KEY=${fromBase64}\n` +
+      'TAURI_SIGNING_PRIVATE_KEY_PASSWORD=secret\n'
+    if (body !== expected) throw new Error(`GITHUB_ENV format mismatch: ${JSON.stringify(body)}`)
+  } finally {
+    if (previousEnv === undefined) delete process.env.GITHUB_ENV
+    else process.env.GITHUB_ENV = previousEnv
+    unlinkSync(envFile)
+  }
   console.log('prepare-updater-key: self-test ok')
 }
 
@@ -266,10 +188,6 @@ function main() {
   const args = parseArgs(process.argv.slice(2))
   if (args.selfTest) {
     selfTest()
-    return
-  }
-  if (args.exec !== null) {
-    execTauri(args)
     return
   }
 
@@ -282,9 +200,13 @@ function main() {
 
   const key = normalizePrivateKey(rawKey)
   const password = normalizePassword(rawPassword)
-  writeSecretFile(args.keyOut, key)
-  writeSecretFile(args.passwordOut, password)
-  console.log(`prepare-updater-key: wrote signing key to ${args.keyOut}`)
+  appendGitHubEnv('TAURI_SIGNING_PRIVATE_KEY', key)
+  appendGitHubEnv('TAURI_SIGNING_PRIVATE_KEY_PASSWORD', password)
+  if (process.env.GITHUB_ENV) {
+    console.log(`prepare-updater-key: exported signing key via GITHUB_ENV (${key.length} bytes, base64)`)
+  } else {
+    console.log('prepare-updater-key: GITHUB_ENV unset; skipped export')
+  }
 }
 
 try {

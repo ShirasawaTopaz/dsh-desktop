@@ -181,12 +181,8 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Do not pass the raw secret as TAURI_SIGNING_PRIVATE_KEY: the
-          # `.key` file starts with `untrusted comment:` and `tauri build`
-          # base64-decodes that string (`Invalid symbol 32, offset 9`).
-          # `--exec` reads the normalized one-line blob from these files.
-          TAURI_UPDATER_KEY_FILE: ${{ github.workspace }}/.ci-tauri-updater.key
-          TAURI_UPDATER_PASSWORD_FILE: ${{ github.workspace }}/.ci-tauri-updater.password
+          # Signing key/password are exported via GITHUB_ENV as a single-line
+          # base64 blob (not a file path, not the raw minisign `.key` text).
           # linuxdeploy is itself an AppImage; GitHub's Ubuntu 24.04 runners
           # cannot FUSE-mount, and its bundled strip rejects ELF .relr.dyn.
           APPIMAGE_EXTRACT_AND_RUN: '1'
@@ -196,4 +192,4 @@ jobs:
           releaseDraft: false
           prerelease: ${{ needs.detect.outputs.prerelease }}
           args: ${{ matrix.target == 'x86_64-unknown-linux-gnu' && '--verbose' || '' }}
-          tauriScript: node scripts/prepare-updater-key.mjs --exec
+          tauriScript: npx --yes @tauri-apps/cli@^2
