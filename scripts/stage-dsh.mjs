@@ -133,7 +133,7 @@ async function main() {
   }, undefined, 2) + '\n')
 
   const installArgs = [
-    'install', '--prefix', stagingDir, '--ignore-scripts', '--no-audit', '--no-fund',
+    'install', '--prefix', stagingDir, '--no-audit', '--no-fund',
     '--cache', cacheDir, `@deepseek-ai/dsh@${version}`,
   ]
   const npm = npmInvocation()

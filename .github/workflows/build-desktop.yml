@@ -159,7 +159,12 @@ jobs:
         run: npm run smoke
 
       - name: Write the build version
+        if: matrix.target != 'x86_64-pc-windows-msvc'
         run: node scripts/set-version.mjs ${{ needs.detect.outputs.version }}
+
+      - name: Write the build version (MSI compatible)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        run: node scripts/set-version.mjs ${{ needs.detect.outputs.version }} --msi-compatible
 
       - name: Normalize updater signing key
         id: signing
