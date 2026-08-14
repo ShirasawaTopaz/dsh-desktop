@@ -6,7 +6,8 @@
  *      staging tree, pinning the whole `@deepseek-ai/dsh-*` family to that
  *      version through npm `overrides` (two passes: install, read the lockfile
  *      for the family member list, then reinstall with the complete override
- *      set), and copy the result into `resources/dsh/`.
+ *      set), drop musl-only native addons on glibc Linux, and copy the result
+ *      into `resources/dsh/`.
  *   2. Download the pinned official Node.js runtime for the current platform
  *      and place it under `src-tauri/binaries/` with the Tauri sidecar naming
  *      convention (`node-<target-triple>[.exe]`), unless `--system-node` is
@@ -22,9 +23,9 @@
 
 import { spawnSync } from 'node:child_process'
 import {
-  chmodSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync,
+  chmodSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync,
 } from 'node:fs'
-import { dirname, join, resolve } from 'node:path'
+import { dirname, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url))
@@ -80,6 +81,52 @@ function dshFamilyFromLock(lockPath) {
     if (match !== null) names.push(match[1])
   }
   return names.sort()
+}
+
+/**
+ * Official Node (and this wrapper) is glibc. Packages such as
+ * `@koromix/koffi-linux-x64` ship both `gnu_*` / `linux_*` and `musl_*`
+ * addons in one tarball. linuxdeploy then walks every ELF in the AppDir,
+ * cannot resolve `libc.musl-x86_64.so.1` on Ubuntu runners, and aborts
+ * AppImage bundling. The musl binaries cannot load against the embedded
+ * glibc Node anyway, so drop them from the staged tree.
+ */
+function isMuslNativeDir(name) {
+  return (
+    /^musl[_-]/i.test(name)
+    || /linuxmusl/i.test(name)
+    || /[-_]musl$/i.test(name)
+    || /[-_]musl[-_]/i.test(name)
+  )
+}
+
+function pruneMuslNativeAddons(root) {
+  const removed = []
+  function walk(dir) {
+    let entries
+    try {
+      entries = readdirSync(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue
+      const full = join(dir, entry.name)
+      if (isMuslNativeDir(entry.name)) {
+        rmSync(full, { recursive: true, force: true })
+        removed.push(relative(root, full).replaceAll('\\', '/'))
+        continue
+      }
+      walk(full)
+    }
+  }
+  walk(root)
+  if (removed.length === 0) {
+    console.log('stage-dsh: no musl native addon paths to prune')
+    return
+  }
+  console.log(`stage-dsh: pruned ${String(removed.length)} musl native addon path(s) (glibc runtime)`)
+  for (const path of removed) console.log(`  - ${path}`)
 }
 
 /** Assert every installed @deepseek-ai/dsh-* package sits on the exact version. */
@@ -153,6 +200,9 @@ async function main() {
   }, undefined, 2) + '\n')
   run(npm.cmd, [...npm.base, ...installArgs])
   verifyFamilyVersion(lockPath, version)
+  if (process.platform === 'linux') {
+    pruneMuslNativeAddons(join(stagingDir, 'node_modules'))
+  }
 
   // Assemble resources/dsh (the sidecar working directory at runtime).
   rmSync(resourcesDsh, { recursive: true, force: true })
