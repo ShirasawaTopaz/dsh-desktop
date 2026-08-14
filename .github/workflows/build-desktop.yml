@@ -166,14 +166,56 @@ jobs:
         if: matrix.target == 'x86_64-pc-windows-msvc'
         run: node scripts/set-version.mjs ${{ needs.detect.outputs.version }} --msi-compatible
 
+      - name: Normalize updater signing key
+        id: signing
+        shell: bash
+        env:
+          RAW_SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          RAW_SIGNING_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          key="${RAW_SIGNING_KEY:-}"
+          passphrase="${RAW_SIGNING_PASSWORD:-}"
+
+          if [ -z "$key" ] || [ -z "$passphrase" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if printf '%s' "$key" | grep -q '\\n'; then
+            key="$(printf '%b' "$key")"
+          fi
+
+          if ! printf '%s' "$key" | grep -q '^untrusted comment:'; then
+            decoded="$(printf '%s' "$key" | base64 --decode 2>/dev/null || true)"
+            if printf '%s' "$decoded" | grep -q '^untrusted comment:'; then
+              key="$decoded"
+            fi
+          fi
+
+          if ! printf '%s' "$key" | grep -q '^untrusted comment:'; then
+            echo "::warning::TAURI_SIGNING_PRIVATE_KEY is present but not a valid minisign secret key. Skipping updater signing for this run."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+          {
+            echo "private_key<<EOF"
+            printf '%s\n' "$key"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "private_key_password=$passphrase" >> "$GITHUB_OUTPUT"
+
       - name: Build and bundle
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Signing is optional: when the secrets are absent, tauri-action
           # skips updater signatures and the release carries unsigned bundles.
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ steps.signing.outputs.private_key }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ steps.signing.outputs.private_key_password }}
         with:
           releaseId: ${{ needs.create-release.outputs.release-id }}
           releaseDraft: false
