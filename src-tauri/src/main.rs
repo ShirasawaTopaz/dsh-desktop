@@ -16,8 +16,18 @@ pub struct AppState {
     pub shutting_down: Arc<AtomicBool>,
 }
 
+/// Exit the app through the normal close path. Invoked by the Settings →
+/// About update flow after the new version finished installing; the
+/// `RunEvent::ExitRequested` handler routes it through the graceful shutdown
+/// bridge (bounded dsh dispose) instead of killing the sidecar.
+#[tauri::command]
+fn desktop_exit(app: tauri::AppHandle) {
+    app.exit(0);
+}
+
 fn main() {
     tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![desktop_exit])
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             // A second launch focuses the existing window instead of forking a
             // second dsh process over the same ~/.dsh session store.

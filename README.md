@@ -14,6 +14,7 @@ WebView ──加载──> http://127.0.0.1:<随机端口>  (dsh web 本地服�
 - **Node 运行时**:官方二进制(版本固定于工作流 `NODE_RUNTIME_VERSION`,须满足 dsh 的 engines `^22.19 || >=24`),按 Tauri sidecar 约定命名后嵌入。
 - **就绪契约**:Rust 壳解析 sidecar stdout 的 `dsh web: http://127.0.0.1:<port>` 就绪行,再导航 WebView;`--port 0` 由系统分配端口。
 - **优雅关停**:关窗/退出时先 `POST /api/tauri/shutdown`(每启动随机 token 鉴权,由 `resources/tauri-shutdown.mjs` 插件提供,经启动时生成的 `--patch` 覆盖层注入),走 dsh 自身的有界 dispose;失败则回退 kill。
+- **设置页「关于」**:启动覆盖层同时注入 wrapper 自有的 `tauri-update` 插件(源码在 `plugins/tauri-update/`,由 `npm run stage` 组装进负载树),在 dsh Web 设置页新增「关于」页:显示当前 dsh 版本 / Node 运行时 / 平台架构,并提供手动「检查更新」「下载并安装」按钮,走与自动更新相同的 GitHub Release + minisign 验签通道,进度与结果在页面内呈现。
 - **数据目录**:沿用 `~/.dsh`,与 dsh CLI 互通会话、配置与凭据。日志在 `~/.dsh/logs/dsh-desktop-*.log`。
 - **单实例**:二次启动聚焦已有窗口,避免两个进程并发写同一会话存储。
 
@@ -47,7 +48,7 @@ cd src-tauri && npx --yes @tauri-apps/cli@^2 build
 
 ## 签名与自动更新
 
-- 自动更新已接入(tauri-plugin-updater + 原生对话框):应用启动 20 秒后首次检查,之后每 6 小时一次,发现新版本即询问是否安装。
+- 自动更新已接入(tauri-plugin-updater):应用启动 20 秒后首次检查,之后每 6 小时一次,发现新版本即弹出原生对话框询问是否安装;设置 →「关于」页另提供手动检查与下载安装入口(更新按钮在发现新版本后可用)。
 - CI 检测到上述 secrets 时,`tauri-action` 会为更新包签名并随 Release 发布 `latest.json` 与 `.sig`;未配置时产物为未签名构建(Windows 有 SmartScreen 提示,macOS 需右键打开或 `xattr -dr com.apple.quarantine`)。
 
 ## 已知限制

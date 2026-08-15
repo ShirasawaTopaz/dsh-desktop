@@ -12,7 +12,10 @@
  *      and place it under `src-tauri/binaries/` with the Tauri sidecar naming
  *      convention (`node-<target-triple>[.exe]`), unless `--system-node` is
  *      passed (local smoke runs use the ambient Node instead).
- *   3. Write `resources/version.json` (upstream version, node version, target).
+ *   3. Copy the wrapper-owned `tauri-update` plugin into the staged
+ *      `node_modules` and declare it in the vendored dsh manifest (so the
+ *      profile module fallback resolves it at boot).
+ *   4. Write `resources/version.json` (upstream version, node version, target).
  *
  * The staged tree is what `tauri build` embeds; the app then spawns
  * `node node_modules/@deepseek-ai/dsh/lib/bin.js --profile web ...` from
@@ -27,6 +30,17 @@ import {
 } from 'node:fs'
 import { dirname, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
+
+/**
+ * Wrapper-owned plugin injected into the staged tree (Settings → About page).
+ * The plugin package ships from `plugins/tauri-update/` and is copied into the
+ * staged `node_modules`; the vendored `@deepseek-ai/dsh` manifest additionally
+ * declares it as a dependency so dsh's profile module fallback symlinks it into
+ * `~/.dsh/profiles/node_modules`, which is what makes the bare-name loader row
+ * and the browser client-modules resolution both work at runtime.
+ */
+const TAURI_UPDATE_PACKAGE = 'tauri-update'
+const TAURI_UPDATE_VERSION = '0.0.0'
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url))
 const NODE_DIST_BASE = 'https://nodejs.org/dist'
@@ -143,6 +157,52 @@ function verifyFamilyVersion(lockPath, version) {
   }
 }
 
+/**
+ * Inject the wrapper-owned tauri-update plugin into the assembled payload:
+ * copy the package into the staged `node_modules` and declare it as a
+ * dependency of the vendored `@deepseek-ai/dsh` manifest. The manifest entry
+ * is what makes `healProfilesModuleFallback` symlink the package into the
+ * profile's module fallback dir at boot, which both the loader (bare-name row
+ * `tauri-update`) and the browser client-modules resolution depend on.
+ *
+ * The vendored manifest is regenerated on every stage (fresh npm install), so
+ * this patch is applied per stage and never drifts across releases.
+ */
+function injectTauriUpdate(resourcesDsh) {
+  const source = join(ROOT, 'plugins', TAURI_UPDATE_PACKAGE)
+  const dest = join(resourcesDsh, 'node_modules', TAURI_UPDATE_PACKAGE)
+  if (!existsSync(join(source, 'package.json'))) {
+    console.error(`stage-dsh: wrapper plugin missing at ${source}`)
+    process.exit(1)
+  }
+  rmSync(dest, { recursive: true, force: true })
+  cpSync(source, dest, { recursive: true })
+
+  const appManifestPath = join(resourcesDsh, 'node_modules', '@deepseek-ai', 'dsh', 'package.json')
+  const appManifest = JSON.parse(readFileSync(appManifestPath, 'utf8'))
+  const dependencies = appManifest.dependencies ?? {}
+  if (dependencies[TAURI_UPDATE_PACKAGE] === undefined) {
+    dependencies[TAURI_UPDATE_PACKAGE] = TAURI_UPDATE_VERSION
+    appManifest.dependencies = Object.fromEntries(
+      Object.entries(dependencies).sort(([a], [b]) => a.localeCompare(b)),
+    )
+    writeFileSync(appManifestPath, JSON.stringify(appManifest, undefined, 2) + '\n')
+  }
+
+  // Verify both post-conditions fail loud (mirrors verifyFamilyVersion).
+  const packaged = join(dest, 'package.json')
+  if (!existsSync(packaged)) {
+    console.error(`stage-dsh: wrapper plugin not staged at ${packaged}`)
+    process.exit(1)
+  }
+  const patched = JSON.parse(readFileSync(appManifestPath, 'utf8'))
+  if (patched.dependencies?.[TAURI_UPDATE_PACKAGE] !== TAURI_UPDATE_VERSION) {
+    console.error('stage-dsh: vendored dsh manifest missing the tauri-update dependency')
+    process.exit(1)
+  }
+  console.log(`stage-dsh: wrapper plugin ${TAURI_UPDATE_PACKAGE} staged`)
+}
+
 async function main() {
   const args = process.argv.slice(2)
   let version
@@ -210,6 +270,7 @@ async function main() {
   cpSync(join(stagingDir, 'node_modules'), join(resourcesDsh, 'node_modules'), { recursive: true })
   cpSync(manifestPath, join(resourcesDsh, 'package.json'))
   cpSync(lockPath, join(resourcesDsh, 'package-lock.json'))
+  injectTauriUpdate(resourcesDsh)
 
   // Node runtime sidecar.
   let nodeVersion = null

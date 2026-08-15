@@ -1,0 +1,19 @@
+{
+  "name": "tauri-update",
+  "version": "0.0.0",
+  "private": true,
+  "description": "dsh-desktop wrapper plugin: About/update surface in the dsh Settings page (version display + manual update via the Tauri updater).",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web"
+    }
+  },
+  "license": "MIT"
+}
