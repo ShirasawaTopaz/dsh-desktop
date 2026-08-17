@@ -1,8 +1,8 @@
 {
-  "name": "tauri-update",
+  "name": "dsh-desktop",
   "version": "0.0.0",
   "private": true,
-  "description": "dsh-desktop wrapper plugin: About/update surface in the dsh Settings page (version display + manual update via the Tauri updater).",
+  "description": "dsh-desktop wrapper plugin: graceful shutdown bridge plus the About/update surface in the dsh Settings page.",
   "type": "module",
   "main": "lib/index.js",
   "exports": {

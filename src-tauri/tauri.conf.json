@@ -27,7 +27,6 @@
     ],
     "resources": {
       "../resources/dsh": "dsh",
-      "../resources/tauri-shutdown.mjs": "tauri-shutdown.mjs",
       "../resources/version.json": "version.json"
     },
     "externalBin": [

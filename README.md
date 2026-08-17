@@ -13,8 +13,8 @@ WebView ──加载──> http://127.0.0.1:<随机端口>  (dsh web 本地服�
 - **运行负载**:CI 以 `npm install @deepseek-ai/dsh@<版本>` 组装(整个 `@deepseek-ai/dsh-*` 家族通过 npm `overrides` 钉死到同一版本),嵌入 `resources/dsh`。
 - **Node 运行时**:官方二进制(版本固定于工作流 `NODE_RUNTIME_VERSION`,须满足 dsh 的 engines `^22.19 || >=24`),按 Tauri sidecar 约定命名后嵌入。
 - **就绪契约**:Rust 壳解析 sidecar stdout 的 `dsh web: http://127.0.0.1:<port>` 就绪行,再导航 WebView;`--port 0` 由系统分配端口。
-- **优雅关停**:关窗/退出时先 `POST /api/tauri/shutdown`(每启动随机 token 鉴权,由 `resources/tauri-shutdown.mjs` 插件提供,经启动时生成的 `--patch` 覆盖层注入),走 dsh 自身的有界 dispose;失败则回退 kill。
-- **设置页「关于」**:启动覆盖层同时注入 wrapper 自有的 `tauri-update` 插件(源码在 `plugins/tauri-update/`,由 `npm run stage` 组装进负载树),在 dsh Web 设置页新增「关于」页:显示当前 dsh 版本 / Node 运行时 / 平台架构,并提供手动「检查更新」「下载并安装」按钮,走与自动更新相同的 GitHub Release + minisign 验签通道,进度与结果在页面内呈现。
+- **优雅关停**:关窗/退出时先 `POST /api/tauri/shutdown`(每启动随机 token 鉴权),走 dsh 自身的有界 dispose;失败则回退 kill。关停桥与设置页「关于」同属 wrapper 自有的 `dsh-desktop` 插件(源码在 `plugins/dsh-desktop/`,由 `npm run stage` 组装进负载树,经启动时生成的 `--patch` 覆盖层以裸名注入)。
+- **设置页「关于」**:同一插件在 dsh Web 设置页新增「关于」页:显示当前 dsh 版本 / Node 运行时 / 平台架构,并提供手动「检查更新」「下载并安装」按钮,走与自动更新相同的 GitHub Release + minisign 验签通道,进度与结果在页面内呈现。
 - **数据目录**:沿用 `~/.dsh`,与 dsh CLI 互通会话、配置与凭据。日志在 `~/.dsh/logs/dsh-desktop-*.log`。
 - **单实例**:二次启动聚焦已有窗口,避免两个进程并发写同一会话存储。
 

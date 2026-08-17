@@ -1,5 +1,5 @@
 /**
- * dsh-desktop tauri-update plugin — browser half.
+ * dsh-desktop wrapper plugin — browser half.
  *
  * Hand-written `__ModuleLoader__.load` bundle (no upstream build toolchain):
  * registers one `settings.section` entry ("about") that renders the wrapper's
@@ -16,7 +16,7 @@
  */
 
 window.__ModuleLoader__.load({
-  id: 'tauri-update',
+  id: 'dsh-desktop',
   factory: (require) => {
     var module = { exports: {} }
     var exports = module.exports

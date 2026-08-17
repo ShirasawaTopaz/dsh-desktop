@@ -12,7 +12,7 @@
  *      and place it under `src-tauri/binaries/` with the Tauri sidecar naming
  *      convention (`node-<target-triple>[.exe]`), unless `--system-node` is
  *      passed (local smoke runs use the ambient Node instead).
- *   3. Copy the wrapper-owned `tauri-update` plugin into the staged
+ *   3. Copy the wrapper-owned `dsh-desktop` plugin into the staged
  *      `node_modules` and declare it in the vendored dsh manifest (so the
  *      profile module fallback resolves it at boot).
  *   4. Write `resources/version.json` (upstream version, node version, target).
@@ -32,15 +32,16 @@ import { dirname, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 /**
- * Wrapper-owned plugin injected into the staged tree (Settings → About page).
- * The plugin package ships from `plugins/tauri-update/` and is copied into the
- * staged `node_modules`; the vendored `@deepseek-ai/dsh` manifest additionally
- * declares it as a dependency so dsh's profile module fallback symlinks it into
- * `~/.dsh/profiles/node_modules`, which is what makes the bare-name loader row
- * and the browser client-modules resolution both work at runtime.
+ * Wrapper-owned plugin injected into the staged tree (shutdown bridge +
+ * Settings → About page). The plugin package ships from `plugins/dsh-desktop/`
+ * and is copied into the staged `node_modules`; the vendored `@deepseek-ai/dsh`
+ * manifest additionally declares it as a dependency so dsh's profile module
+ * fallback symlinks it into `~/.dsh/profiles/node_modules`, which is what
+ * makes the bare-name loader row and the browser client-modules resolution
+ * both work at runtime.
  */
-const TAURI_UPDATE_PACKAGE = 'tauri-update'
-const TAURI_UPDATE_VERSION = '0.0.0'
+const WRAPPER_PLUGIN_PACKAGE = 'dsh-desktop'
+const WRAPPER_PLUGIN_VERSION = '0.0.0'
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url))
 const NODE_DIST_BASE = 'https://nodejs.org/dist'
@@ -158,19 +159,19 @@ function verifyFamilyVersion(lockPath, version) {
 }
 
 /**
- * Inject the wrapper-owned tauri-update plugin into the assembled payload:
+ * Inject the wrapper-owned dsh-desktop plugin into the assembled payload:
  * copy the package into the staged `node_modules` and declare it as a
  * dependency of the vendored `@deepseek-ai/dsh` manifest. The manifest entry
  * is what makes `healProfilesModuleFallback` symlink the package into the
  * profile's module fallback dir at boot, which both the loader (bare-name row
- * `tauri-update`) and the browser client-modules resolution depend on.
+ * `dsh-desktop`) and the browser client-modules resolution depend on.
  *
  * The vendored manifest is regenerated on every stage (fresh npm install), so
  * this patch is applied per stage and never drifts across releases.
  */
-function injectTauriUpdate(resourcesDsh) {
-  const source = join(ROOT, 'plugins', TAURI_UPDATE_PACKAGE)
-  const dest = join(resourcesDsh, 'node_modules', TAURI_UPDATE_PACKAGE)
+function injectWrapperPlugin(resourcesDsh) {
+  const source = join(ROOT, 'plugins', WRAPPER_PLUGIN_PACKAGE)
+  const dest = join(resourcesDsh, 'node_modules', WRAPPER_PLUGIN_PACKAGE)
   if (!existsSync(join(source, 'package.json'))) {
     console.error(`stage-dsh: wrapper plugin missing at ${source}`)
     process.exit(1)
@@ -181,8 +182,8 @@ function injectTauriUpdate(resourcesDsh) {
   const appManifestPath = join(resourcesDsh, 'node_modules', '@deepseek-ai', 'dsh', 'package.json')
   const appManifest = JSON.parse(readFileSync(appManifestPath, 'utf8'))
   const dependencies = appManifest.dependencies ?? {}
-  if (dependencies[TAURI_UPDATE_PACKAGE] === undefined) {
-    dependencies[TAURI_UPDATE_PACKAGE] = TAURI_UPDATE_VERSION
+  if (dependencies[WRAPPER_PLUGIN_PACKAGE] === undefined) {
+    dependencies[WRAPPER_PLUGIN_PACKAGE] = WRAPPER_PLUGIN_VERSION
     appManifest.dependencies = Object.fromEntries(
       Object.entries(dependencies).sort(([a], [b]) => a.localeCompare(b)),
     )
@@ -196,11 +197,11 @@ function injectTauriUpdate(resourcesDsh) {
     process.exit(1)
   }
   const patched = JSON.parse(readFileSync(appManifestPath, 'utf8'))
-  if (patched.dependencies?.[TAURI_UPDATE_PACKAGE] !== TAURI_UPDATE_VERSION) {
-    console.error('stage-dsh: vendored dsh manifest missing the tauri-update dependency')
+  if (patched.dependencies?.[WRAPPER_PLUGIN_PACKAGE] !== WRAPPER_PLUGIN_VERSION) {
+    console.error('stage-dsh: vendored dsh manifest missing the dsh-desktop dependency')
     process.exit(1)
   }
-  console.log(`stage-dsh: wrapper plugin ${TAURI_UPDATE_PACKAGE} staged`)
+  console.log(`stage-dsh: wrapper plugin ${WRAPPER_PLUGIN_PACKAGE} staged`)
 }
 
 async function main() {
@@ -270,7 +271,7 @@ async function main() {
   cpSync(join(stagingDir, 'node_modules'), join(resourcesDsh, 'node_modules'), { recursive: true })
   cpSync(manifestPath, join(resourcesDsh, 'package.json'))
   cpSync(lockPath, join(resourcesDsh, 'package-lock.json'))
-  injectTauriUpdate(resourcesDsh)
+  injectWrapperPlugin(resourcesDsh)
 
   // Node runtime sidecar.
   let nodeVersion = null
