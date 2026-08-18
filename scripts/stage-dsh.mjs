@@ -452,20 +452,38 @@ function materializeAtImg(root) {
   }
 }
 
-function installSharpPlatformPackages(stagingDir, cacheDir, platformKey, npm) {
-  const dash = platformKey.indexOf('-')
-  const os = platformKey.slice(0, dash)
-  const cpu = platformKey.slice(dash + 1)
+/**
+ * Fetch this platform's sharp addon + libvips via `npm pack` into an isolated
+ * directory (not the staging prefix). A second `npm install` into staging
+ * hits EOVERRIDE because staging's package.json pins `@deepseek-ai/dsh`
+ * through `overrides`. The tarball extract is a real copy, not a symlink.
+ */
+function packSharpPlatformPackages(nodeModules, cacheDir, platformKey, npm) {
   const pkgs = [`@img/sharp-${platformKey}`]
   if (!platformKey.startsWith('win32')) pkgs.push(`@img/sharp-libvips-${platformKey}`)
-  const args = [
-    'install', '--prefix', stagingDir, '--no-audit', '--no-fund',
-    '--include=optional', `--os=${os}`, `--cpu=${cpu}`,
-    '--cache', cacheDir, ...pkgs,
-  ]
-  if (os === 'linux') args.splice(args.indexOf('--cache'), 0, '--libc=glibc')
-  console.log(`stage-dsh: installing ${pkgs.join(', ')} for ${os}/${cpu}`)
-  run(npm.cmd, [...npm.base, ...args])
+  const tmp = join(dirname(nodeModules), '.sharp-pack')
+  rmSync(tmp, { recursive: true, force: true })
+  mkdirSync(tmp, { recursive: true })
+  for (const pkg of pkgs) {
+    console.log(`stage-dsh: npm pack ${pkg}`)
+    run(npm.cmd, [...npm.base, 'pack', pkg, '--pack-destination', tmp, '--cache', cacheDir])
+  }
+  const destImg = join(nodeModules, '@img')
+  mkdirSync(destImg, { recursive: true })
+  for (const name of readdirSync(tmp)) {
+    if (!name.endsWith('.tgz')) continue
+    const extractDir = join(tmp, name.slice(0, -4))
+    mkdirSync(extractDir, { recursive: true })
+    run('tar', ['-xf', join(tmp, name), '-C', extractDir])
+    const packed = join(extractDir, 'package')
+    const manifest = JSON.parse(readFileSync(join(packed, 'package.json'), 'utf8'))
+    const folder = String(manifest.name).split('/').pop()
+    const dest = join(destImg, folder)
+    rmSync(dest, { recursive: true, force: true })
+    cpSync(packed, dest, { recursive: true })
+    console.log(`stage-dsh: unpacked ${manifest.name}@${manifest.version} -> @img/${folder}`)
+  }
+  rmSync(tmp, { recursive: true, force: true })
 }
 
 /**
@@ -657,7 +675,7 @@ async function main() {
   }, undefined, 2) + '\n')
   run(npm.cmd, [...npm.base, ...installArgs])
   verifyFamilyVersion(lockPath, version)
-  installSharpPlatformPackages(stagingDir, cacheDir, key, npm)
+  packSharpPlatformPackages(join(stagingDir, 'node_modules'), cacheDir, key, npm)
   if (process.platform === 'linux') {
     pruneMuslNativeAddons(join(stagingDir, 'node_modules'))
   }
