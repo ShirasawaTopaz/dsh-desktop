@@ -159,8 +159,11 @@ function pruneMuslNativeAddons(root) {
  *   - prose docs (`.md`), keeping NOTICE/LICENSE/COPYING for compliance;
  *   - `prebuilds/<tag>/` dirs whose tag does not match this build's
  *     `<platform>-<arch>` (e.g. win32-arm64 prebuilds inside an x64 build);
- *   - `@img/sharp-*` platform packages other than this build's — the wasm
- *     fallback only ever loads when no native build exists.
+ *   - `@img/sharp-*` platform packages other than this build's native addon
+ *     and (on Darwin/Linux) its sibling `@img/sharp-libvips-*` shared library.
+ *     Windows vendors libvips DLLs inside `sharp-win32-*`, so there is no
+ *     separate libvips package to keep. The wasm fallback only ever loads
+ *     when no native build exists.
  *
  * Deliberately NOT touched: non-declaration `.ts`/`.mts` (some packages ship
  * runtime TS sources, including @deepseek-ai/cordis), `.node`/`.dll`/`.exe`
@@ -171,19 +174,22 @@ const DECLARATION_RE = /\.d\.[cm]?ts$/i
 const DOC_RE = /\.md$/i
 const LEGAL_RE = /(?:NOTICE|LICEN[CS]E|COPYING)/i
 
-/** The @img platform package that must survive for each build target. */
-const SHARP_NATIVE_PACKAGE = {
-  'win32-x64': 'sharp-win32-x64',
-  'win32-arm64': 'sharp-win32-arm64',
-  'darwin-arm64': 'sharp-darwin-arm64',
-  'darwin-x64': 'sharp-darwin-x64',
-  'linux-x64': 'sharp-linux-x64',
-  'linux-arm64': 'sharp-linux-arm64',
+/**
+ * `@img` packages that must survive for each build target.
+ *
+ * Darwin/Linux load `libvips-cpp` from a sibling `@img/sharp-libvips-*`
+ * package (rpath / DT_NEEDED). A keep-list of only `sharp-<platform>-<arch>`
+ * used to match `^sharp-` against `sharp-libvips-*` as well and delete it,
+ * which then failed smoke with `no such file` / `ERR_DLOPEN_FAILED`.
+ * Windows has no published `@img/sharp-libvips-win32-*` optional dep.
+ */
+function sharpPackagesToKeep(platformKey) {
+  return new Set([`sharp-${platformKey}`, `sharp-libvips-${platformKey}`])
 }
 
 function pruneRuntimeFat(root, platformKey) {
   const keepPrebuildTag = platformKey
-  const keepSharp = SHARP_NATIVE_PACKAGE[platformKey]
+  const keepSharp = sharpPackagesToKeep(platformKey)
   let removedFiles = 0
   let removedBytes = 0
   const removedDirs = []
@@ -249,9 +255,9 @@ function pruneRuntimeFat(root, platformKey) {
           removeDir(full)
           continue
         }
-        // @img ships one package per platform plus a wasm fallback; only the
-        // native package for this build can ever be selected at runtime.
-        if (inSharpScope && /^sharp-/.test(entry.name) && entry.name !== keepSharp) {
+        // @img ships one addon + (unix) libvips package per platform, plus a
+        // wasm fallback. Only this build's native pair can be selected.
+        if (inSharpScope && /^sharp-/.test(entry.name) && !keepSharp.has(entry.name)) {
           removedDirs.push(`@img/${entry.name}`)
           removeDir(full)
           continue
@@ -274,6 +280,24 @@ function pruneRuntimeFat(root, platformKey) {
     `stage-dsh: pruned runtime fat for ${platformKey}: ${String(removedFiles)} file(s) / `
     + `${(removedBytes / 1e6).toFixed(1)} MB${removedDirs.length > 0 ? `, dirs: ${removedDirs.join(', ')}` : ''}`,
   )
+}
+
+/** Fail the stage if prune (or a skipped optional install) dropped sharp's native pair. */
+function verifySharpNative(root, platformKey) {
+  const img = join(root, '@img')
+  const native = `sharp-${platformKey}`
+  if (!existsSync(join(img, native))) {
+    console.error(`stage-dsh: required sharp native package missing: @img/${native}`)
+    process.exit(1)
+  }
+  // Windows vendors libvips inside sharp-win32-*; Darwin/Linux need the sibling.
+  if (!platformKey.startsWith('win32')) {
+    const libvips = `sharp-libvips-${platformKey}`
+    if (!existsSync(join(img, libvips))) {
+      console.error(`stage-dsh: required sharp libvips package missing: @img/${libvips}`)
+      process.exit(1)
+    }
+  }
 }
 
 /** Assert every installed @deepseek-ai/dsh-* package sits on the exact version. */
@@ -397,6 +421,7 @@ async function main() {
     pruneMuslNativeAddons(join(stagingDir, 'node_modules'))
   }
   pruneRuntimeFat(join(stagingDir, 'node_modules'), key)
+  verifySharpNative(join(stagingDir, 'node_modules'), key)
 
   // Assemble resources/dsh (the sidecar working directory at runtime).
   rmSync(resourcesDsh, { recursive: true, force: true })
