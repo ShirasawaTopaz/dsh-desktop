@@ -413,9 +413,20 @@ function resolveOriginPath(nodeDir, token) {
   return resolve(nodeDir, stripped)
 }
 
+function sameFile(a, b) {
+  if (resolve(a) === resolve(b)) return true
+  try {
+    return existsSync(a) && existsSync(b) && realpathSync(a) === realpathSync(b)
+  } catch {
+    return false
+  }
+}
+
 function placeLibvips(src, destDir, libFile) {
   mkdirSync(destDir, { recursive: true })
   const dest = join(destDir, libFile)
+  // One baked rpath is the libvips package's own lib/ (where we found src).
+  if (sameFile(src, dest)) return
   cpSync(src, dest, { dereference: true })
   try {
     chmodSync(dest, 0o755)
