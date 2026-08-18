@@ -108,10 +108,9 @@ fn random_hex(bytes: usize) -> String {
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Prepend staged sharp/libvips `lib/` dirs to the dynamic-linker search path.
-/// Linux uses this as a fallback when the `.node` rpath does not match npm's
-/// hoist layout. macOS may strip `DYLD_*` for a signed Node; stage-dsh also
-/// embeds `libvips-cpp` next to the addon and adds `@loader_path`.
+/// Directories listed by stage-dsh in `.dsh-lib-path` (relative to the dsh
+/// payload root), plus a small fallback walk of `@img`. Linux uses this as
+/// LD_LIBRARY_PATH; macOS may strip DYLD_* for a signed Node.
 fn sharp_library_path(dsh_dir: &Path) -> Option<(String, String)> {
     let env_name = if cfg!(target_os = "linux") {
         "LD_LIBRARY_PATH"
@@ -120,30 +119,37 @@ fn sharp_library_path(dsh_dir: &Path) -> Option<(String, String)> {
     } else {
         return None;
     };
-    let img_roots = [
-        dsh_dir.join("node_modules").join("@img"),
-        dsh_dir
-            .join("node_modules")
-            .join("sharp")
-            .join("node_modules")
-            .join("@img"),
-    ];
     let mut dirs = Vec::new();
-    for img in img_roots {
-        let Ok(entries) = std::fs::read_dir(&img) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
-                continue;
-            };
-            if !name.starts_with("sharp-") {
+    if let Ok(text) = std::fs::read_to_string(dsh_dir.join(".dsh-lib-path")) {
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
                 continue;
             }
-            let lib = entry.path().join("lib");
-            if lib.is_dir() {
-                dirs.push(lib);
+            let path = dsh_dir.join(line);
+            if path.is_dir() {
+                dirs.push(path);
+            }
+        }
+    }
+    if dirs.is_empty() {
+        let img_roots = [
+            dsh_dir.join("node_modules").join("@img"),
+            dsh_dir
+                .join("node_modules")
+                .join("sharp")
+                .join("node_modules")
+                .join("@img"),
+        ];
+        for img in img_roots {
+            let Ok(entries) = std::fs::read_dir(&img) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let lib = entry.path().join("lib");
+                if lib.is_dir() {
+                    dirs.push(lib);
+                }
             }
         }
     }
@@ -237,7 +243,7 @@ pub fn spawn(
     let (ready_tx, ready_rx) = channel();
     let (exited_tx, exited_rx) = channel();
 
-    let command = app
+    let mut command = app
         .shell()
         .sidecar("node")?
         .args([

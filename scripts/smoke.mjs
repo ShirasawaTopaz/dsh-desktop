@@ -20,7 +20,7 @@
 
 import { spawn } from 'node:child_process'
 import { request } from 'node:http'
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { delimiter, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -59,28 +59,48 @@ function parseArgs(argv) {
 }
 
 /**
- * Linux dlopen of sharp's `.node` follows DT_RPATH then LD_LIBRARY_PATH.
- * Prepend staged libvips dirs so smoke still works if rpath does not match
- * npm's hoist layout. (macOS may strip DYLD_* on a signed Node binary.)
+ * Directories that contain `libvips-cpp`, so Linux dlopen can find it via
+ * LD_LIBRARY_PATH. Prefers `.dsh-lib-path` written by stage-dsh; falls back
+ * to a tree walk. macOS signed Node often ignores DYLD_*.
  */
 function sharpLibraryEnv(dshRoot) {
   if (process.platform === 'win32') return {}
-  const key = `${process.platform}-${process.arch}`
-  const imgRoots = [
-    join(dshRoot, 'node_modules', '@img'),
-    join(dshRoot, 'node_modules', 'sharp', 'node_modules', '@img'),
-  ]
   const dirs = []
-  for (const img of imgRoots) {
-    for (const name of [`sharp-${key}`, `sharp-libvips-${key}`]) {
-      const lib = join(img, name, 'lib')
-      if (existsSync(lib)) dirs.push(lib)
+  const listed = join(dshRoot, '.dsh-lib-path')
+  if (existsSync(listed)) {
+    for (const line of readFileSync(listed, 'utf8').split(/\r?\n/)) {
+      const rel = line.trim()
+      if (rel === '') continue
+      const dir = join(dshRoot, rel)
+      if (existsSync(dir)) dirs.push(dir)
     }
+  }
+  if (dirs.length === 0) {
+    function walk(dir, depth) {
+      if (depth > 16) return
+      let entries
+      try {
+        entries = readdirSync(dir, { withFileTypes: true })
+      } catch {
+        return
+      }
+      for (const entry of entries) {
+        const full = join(dir, entry.name)
+        if (entry.isFile() && /^libvips-cpp\./.test(entry.name)) {
+          dirs.push(dir)
+          return
+        }
+        if (entry.isDirectory()) walk(full, depth + 1)
+      }
+    }
+    walk(join(dshRoot, 'node_modules'), 0)
   }
   if (dirs.length === 0) return {}
   const envName = process.platform === 'darwin' ? 'DYLD_FALLBACK_LIBRARY_PATH' : 'LD_LIBRARY_PATH'
   const prev = process.env[envName]
-  return { [envName]: prev ? `${dirs.join(delimiter)}${delimiter}${prev}` : dirs.join(delimiter) }
+  const value = prev ? `${dirs.join(delimiter)}${delimiter}${prev}` : dirs.join(delimiter)
+  console.log(`smoke: ${envName}=${value}`)
+  return { [envName]: value }
 }
 
 /** Read the child's stdout line stream, resolving with the matched port. */
