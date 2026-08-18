@@ -28,7 +28,7 @@
 
 import { spawnSync } from 'node:child_process'
 import {
-  chmodSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync,
+  chmodSync, cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync,
 } from 'node:fs'
 import { basename, dirname, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -161,6 +161,9 @@ function pruneMuslNativeAddons(root) {
  *     `<platform>-<arch>` (e.g. win32-arm64 prebuilds inside an x64 build);
  *   - `@img/sharp-*` platform packages other than this build's native addon
  *     and (on Darwin/Linux) its sibling `@img/sharp-libvips-*` shared library.
+ *     The prebuilt `.node` rpath does not search the addon's own `lib/`, so
+ *     after prune we copy libvips next to every nested addon, embed
+ *     `libvips-cpp` beside the `.node`, and add `$ORIGIN` / `@loader_path`.
  *     Windows vendors libvips DLLs inside `sharp-win32-*`, so there is no
  *     separate libvips package to keep. The wasm fallback only ever loads
  *     when no native build exists.
@@ -256,10 +259,13 @@ function pruneRuntimeFat(root, platformKey) {
           continue
         }
         // @img ships one addon + (unix) libvips package per platform, plus a
-        // wasm fallback. Only this build's native pair can be selected.
-        if (inSharpScope && /^sharp-/.test(entry.name) && !keepSharp.has(entry.name)) {
-          removedDirs.push(`@img/${entry.name}`)
-          removeDir(full)
+        // wasm fallback. Only this build's native pair can be selected; leave
+        // kept packages intact (do not fat-prune inside them).
+        if (inSharpScope && /^sharp-/.test(entry.name)) {
+          if (!keepSharp.has(entry.name)) {
+            removedDirs.push(`@img/${entry.name}`)
+            removeDir(full)
+          }
           continue
         }
         walk(full)
@@ -282,19 +288,241 @@ function pruneRuntimeFat(root, platformKey) {
   )
 }
 
-/** Fail the stage if prune (or a skipped optional install) dropped sharp's native pair. */
-function verifySharpNative(root, platformKey) {
-  const img = join(root, '@img')
-  const native = `sharp-${platformKey}`
-  if (!existsSync(join(img, native))) {
-    console.error(`stage-dsh: required sharp native package missing: @img/${native}`)
+/**
+ * Locate every `node_modules/@img/<packageName>` directory, including copies
+ * nested under `sharp` or other dependents. Follows directory symlinks.
+ */
+function findAtImgPackages(root, packageName) {
+  const found = []
+  const seen = new Set()
+  function walk(dir) {
+    let real
+    try {
+      real = realpathSync(dir)
+    } catch {
+      return
+    }
+    const already = seen.has(real)
+    seen.add(real)
+    let entries
+    try {
+      entries = readdirSync(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    const parent = basename(dir)
+    for (const entry of entries) {
+      const full = join(dir, entry.name)
+      let isDir = entry.isDirectory()
+      if (entry.isSymbolicLink()) {
+        try {
+          isDir = statSync(full).isDirectory()
+        } catch {
+          continue
+        }
+      }
+      if (!isDir) continue
+      // Record every logical path, even when this dir is a symlink to one
+      // already walked — Node may dlopen via the nested path, and $ORIGIN
+      // then will not match the hoisted sibling.
+      if (parent === '@img' && entry.name === packageName) found.push(full)
+      if (!already) walk(full)
+    }
+  }
+  walk(root)
+  return found
+}
+
+function libvipsSharedLib(libDir, platformKey) {
+  if (!existsSync(libDir)) return null
+  const re = platformKey.startsWith('darwin')
+    ? /^libvips-cpp\..+\.dylib$/
+    : /^libvips-cpp\.so/
+  return readdirSync(libDir).find(name => re.test(name)) ?? null
+}
+
+/**
+ * The prebuilt `.node` rpath lists sibling/hoist/yarn/npm-hash layouts but
+ * not `$ORIGIN` / `@loader_path` (the addon's own `lib/` directory). Copy
+ * libvips-cpp next to the addon and add that rpath so dlopen no longer
+ * depends on npm's hoist vs nest layout.
+ */
+function patchLoaderRpath(nodeFile, platformKey) {
+  if (platformKey.startsWith('linux')) {
+    const printed = spawnSync('patchelf', ['--print-rpath', nodeFile], { encoding: 'utf8' })
+    if (printed.status !== 0) {
+      console.error(
+        `stage-dsh: warning: patchelf --print-rpath failed for ${nodeFile}: ${printed.stderr || printed.stdout}`
+        + ' (install patchelf; falling back to LD_LIBRARY_PATH at runtime)',
+      )
+      return
+    }
+    const current = (printed.stdout ?? '').trim()
+    if (current.split(':').includes('$ORIGIN')) return
+    const next = current === '' ? '$ORIGIN' : `$ORIGIN:${current}`
+    const patched = spawnSync(
+      'patchelf',
+      ['--force-rpath', '--set-rpath', next, nodeFile],
+      { encoding: 'utf8' },
+    )
+    if (patched.status !== 0) {
+      console.error(
+        `stage-dsh: warning: patchelf --set-rpath failed for ${nodeFile}: ${patched.stderr || patched.stdout}`,
+      )
+    }
+    return
+  }
+  if (platformKey.startsWith('darwin')) {
+    const added = spawnSync('install_name_tool', ['-add_rpath', '@loader_path', nodeFile], { encoding: 'utf8' })
+    const err = `${added.stderr ?? ''}${added.stdout ?? ''}`
+    if (added.status !== 0 && !/duplicate/i.test(err)) {
+      console.error(`stage-dsh: install_name_tool failed for ${nodeFile}: ${err}`)
+      process.exit(1)
+    }
+    if (added.status === 0) {
+      const signed = spawnSync(
+        'codesign',
+        ['--sign', '-', '--force', '--timestamp=none', nodeFile],
+        { encoding: 'utf8' },
+      )
+      if (signed.status !== 0) {
+        console.error(`stage-dsh: codesign failed for ${nodeFile}: ${signed.stderr || signed.stdout}`)
+        process.exit(1)
+      }
+    }
+  }
+}
+
+function embedLibvipsBesideAddon(nativeDir, canonical, libFile, platformKey, patchedNodes) {
+  const destLib = join(nativeDir, 'lib')
+  if (!existsSync(destLib)) {
+    console.error(`stage-dsh: sharp native package has no lib/: ${nativeDir}`)
     process.exit(1)
   }
-  // Windows vendors libvips inside sharp-win32-*; Darwin/Linux need the sibling.
-  if (!platformKey.startsWith('win32')) {
-    const libvips = `sharp-libvips-${platformKey}`
-    if (!existsSync(join(img, libvips))) {
-      console.error(`stage-dsh: required sharp libvips package missing: @img/${libvips}`)
+  const dest = join(destLib, libFile)
+  cpSync(join(canonical, 'lib', libFile), dest, { dereference: true })
+  try {
+    chmodSync(dest, 0o755)
+  } catch { /* mode is best-effort on some filesystems */ }
+  for (const name of readdirSync(destLib)) {
+    if (!name.endsWith('.node')) continue
+    const nodeFile = join(destLib, name)
+    let real
+    try {
+      real = realpathSync(nodeFile)
+    } catch {
+      real = nodeFile
+    }
+    if (patchedNodes.has(real)) continue
+    patchedNodes.add(real)
+    patchLoaderRpath(nodeFile, platformKey)
+  }
+}
+
+/** Replace a package directory symlink with a real copy so later tree copies stay valid. */
+function materializePackageDir(dir) {
+  let st
+  try {
+    st = lstatSync(dir)
+  } catch {
+    return
+  }
+  if (!st.isSymbolicLink()) return
+  const real = realpathSync(dir)
+  const tmp = `${dir}.__real`
+  rmSync(tmp, { recursive: true, force: true })
+  cpSync(real, tmp, { recursive: true, dereference: true })
+  rmSync(dir, { force: true })
+  renameSync(tmp, dir)
+}
+
+/**
+ * Darwin/Linux `.node` addons load `libvips-cpp` via rpath that expects a
+ * sibling `@img/sharp-libvips-*` (and several package-manager layouts), but
+ * not the addon's own `lib/` directory. npm often hoists libvips while
+ * nesting the addon (or the reverse). Copy libvips next to every addon, then
+ * also drop `libvips-cpp` beside the `.node` and add `$ORIGIN` / `@loader_path`
+ * so dlopen works regardless of hoist layout.
+ */
+function vendorSharpLibvips(root, platformKey) {
+  if (platformKey.startsWith('win32')) return
+  const nativeName = `sharp-${platformKey}`
+  const vipsName = `sharp-libvips-${platformKey}`
+  const nativeDirs = findAtImgPackages(root, nativeName)
+  const vipsDirs = findAtImgPackages(root, vipsName)
+  if (nativeDirs.length === 0) {
+    console.error(`stage-dsh: required sharp native package missing: @img/${nativeName}`)
+    process.exit(1)
+  }
+  let canonical
+  let libFile
+  for (const dir of vipsDirs) {
+    const hit = libvipsSharedLib(join(dir, 'lib'), platformKey)
+    if (hit !== null) {
+      canonical = dir
+      libFile = hit
+      break
+    }
+  }
+  if (canonical === undefined || libFile === undefined) {
+    console.error(
+      vipsDirs.length === 0
+        ? `stage-dsh: required sharp libvips package missing: @img/${vipsName}`
+        : `stage-dsh: @img/${vipsName} is present but lib/ has no libvips-cpp shared library`,
+    )
+    process.exit(1)
+  }
+  let copied = 0
+  const patchedNodes = new Set()
+  for (const nativeDir of nativeDirs) {
+    const sibling = join(dirname(nativeDir), vipsName)
+    let same = false
+    try {
+      same = existsSync(sibling) && realpathSync(sibling) === realpathSync(canonical)
+    } catch {
+      same = false
+    }
+    if (!(same || libvipsSharedLib(join(sibling, 'lib'), platformKey) === libFile)) {
+      rmSync(sibling, { recursive: true, force: true })
+      cpSync(canonical, sibling, { recursive: true, dereference: true })
+      copied += 1
+    }
+    embedLibvipsBesideAddon(nativeDir, canonical, libFile, platformKey, patchedNodes)
+  }
+  for (const dir of [...nativeDirs, canonical, ...vipsDirs]) {
+    materializePackageDir(dir)
+  }
+  console.log(
+    `stage-dsh: sharp libvips ${libFile} next to ${String(nativeDirs.length)} native addon(s)`
+    + (copied > 0 ? `, copied ${String(copied)}` : '')
+    + (patchedNodes.size > 0 ? `, patched ${String(patchedNodes.size)} .node rpath(s)` : ''),
+  )
+}
+
+/** Fail the stage if prune (or a skipped optional install) dropped sharp's native pair. */
+function verifySharpNative(root, platformKey) {
+  const nativeName = `sharp-${platformKey}`
+  const nativeDirs = findAtImgPackages(root, nativeName)
+  if (nativeDirs.length === 0) {
+    console.error(`stage-dsh: required sharp native package missing: @img/${nativeName}`)
+    process.exit(1)
+  }
+  if (platformKey.startsWith('win32')) return
+  const vipsName = `sharp-libvips-${platformKey}`
+  for (const nativeDir of nativeDirs) {
+    const besideNode = join(nativeDir, 'lib')
+    if (libvipsSharedLib(besideNode, platformKey) === null) {
+      console.error(
+        `stage-dsh: libvips-cpp missing beside .node at ${relative(root, besideNode).replaceAll('\\', '/')}`,
+      )
+      process.exit(1)
+    }
+    const siblingLib = join(dirname(nativeDir), vipsName, 'lib')
+    if (libvipsSharedLib(siblingLib, platformKey) === null) {
+      console.error(
+        `stage-dsh: libvips-cpp missing next to ${relative(root, nativeDir).replaceAll('\\', '/')} `
+        + `(looked in ${relative(root, siblingLib).replaceAll('\\', '/')})`,
+      )
       process.exit(1)
     }
   }
@@ -421,12 +649,14 @@ async function main() {
     pruneMuslNativeAddons(join(stagingDir, 'node_modules'))
   }
   pruneRuntimeFat(join(stagingDir, 'node_modules'), key)
+  vendorSharpLibvips(join(stagingDir, 'node_modules'), key)
   verifySharpNative(join(stagingDir, 'node_modules'), key)
 
   // Assemble resources/dsh (the sidecar working directory at runtime).
   rmSync(resourcesDsh, { recursive: true, force: true })
   mkdirSync(resourcesDsh, { recursive: true })
   cpSync(join(stagingDir, 'node_modules'), join(resourcesDsh, 'node_modules'), { recursive: true })
+  verifySharpNative(join(resourcesDsh, 'node_modules'), key)
   cpSync(manifestPath, join(resourcesDsh, 'package.json'))
   cpSync(lockPath, join(resourcesDsh, 'package-lock.json'))
   injectWrapperPlugin(resourcesDsh)

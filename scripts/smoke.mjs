@@ -20,9 +20,9 @@
 
 import { spawn } from 'node:child_process'
 import { request } from 'node:http'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { delimiter, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url))
@@ -56,6 +56,31 @@ function parseArgs(argv) {
     }
   }
   return args
+}
+
+/**
+ * Linux dlopen of sharp's `.node` follows DT_RPATH then LD_LIBRARY_PATH.
+ * Prepend staged libvips dirs so smoke still works if rpath does not match
+ * npm's hoist layout. (macOS may strip DYLD_* on a signed Node binary.)
+ */
+function sharpLibraryEnv(dshRoot) {
+  if (process.platform === 'win32') return {}
+  const key = `${process.platform}-${process.arch}`
+  const imgRoots = [
+    join(dshRoot, 'node_modules', '@img'),
+    join(dshRoot, 'node_modules', 'sharp', 'node_modules', '@img'),
+  ]
+  const dirs = []
+  for (const img of imgRoots) {
+    for (const name of [`sharp-${key}`, `sharp-libvips-${key}`]) {
+      const lib = join(img, name, 'lib')
+      if (existsSync(lib)) dirs.push(lib)
+    }
+  }
+  if (dirs.length === 0) return {}
+  const envName = process.platform === 'darwin' ? 'DYLD_FALLBACK_LIBRARY_PATH' : 'LD_LIBRARY_PATH'
+  const prev = process.env[envName]
+  return { [envName]: prev ? `${dirs.join(delimiter)}${delimiter}${prev}` : dirs.join(delimiter) }
 }
 
 /** Read the child's stdout line stream, resolving with the matched port. */
@@ -118,6 +143,7 @@ async function main() {
     cwd: args.dsh,
     env: {
       ...process.env,
+      ...sharpLibraryEnv(args.dsh),
       DSH_HOME: home,
       DSH_TELEMETRY_DISABLED: '1',
       DSH_TAURI_SHUTDOWN_TOKEN: token,

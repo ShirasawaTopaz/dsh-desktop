@@ -108,6 +108,60 @@ fn random_hex(bytes: usize) -> String {
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Prepend staged sharp/libvips `lib/` dirs to the dynamic-linker search path.
+/// Linux uses this as a fallback when the `.node` rpath does not match npm's
+/// hoist layout. macOS may strip `DYLD_*` for a signed Node; stage-dsh also
+/// embeds `libvips-cpp` next to the addon and adds `@loader_path`.
+fn sharp_library_path(dsh_dir: &Path) -> Option<(String, String)> {
+    let env_name = if cfg!(target_os = "linux") {
+        "LD_LIBRARY_PATH"
+    } else if cfg!(target_os = "macos") {
+        "DYLD_FALLBACK_LIBRARY_PATH"
+    } else {
+        return None;
+    };
+    let img_roots = [
+        dsh_dir.join("node_modules").join("@img"),
+        dsh_dir
+            .join("node_modules")
+            .join("sharp")
+            .join("node_modules")
+            .join("@img"),
+    ];
+    let mut dirs = Vec::new();
+    for img in img_roots {
+        let Ok(entries) = std::fs::read_dir(&img) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if !name.starts_with("sharp-") {
+                continue;
+            }
+            let lib = entry.path().join("lib");
+            if lib.is_dir() {
+                dirs.push(lib);
+            }
+        }
+    }
+    if dirs.is_empty() {
+        return None;
+    }
+    let extra = dirs
+        .iter()
+        .filter_map(|path| path.to_str().map(str::to_owned))
+        .collect::<Vec<_>>()
+        .join(":");
+    let value = match std::env::var(env_name) {
+        Ok(prev) if !prev.is_empty() => format!("{extra}:{prev}"),
+        _ => extra,
+    };
+    Some((env_name.to_string(), value))
+}
+
 /// Pump sidecar output into the log, detect the readiness line, and report
 /// termination (with an error page when the process dies unexpectedly). The
 /// event receiver is a tokio channel, so the pump owns a minimal runtime.
@@ -183,7 +237,7 @@ pub fn spawn(
     let (ready_tx, ready_rx) = channel();
     let (exited_tx, exited_rx) = channel();
 
-    let (rx, child) = app
+    let command = app
         .shell()
         .sidecar("node")?
         .args([
@@ -199,8 +253,11 @@ pub fn spawn(
         ])
         .current_dir(&dsh_dir)
         .env("DSH_TELEMETRY_DISABLED", "1")
-        .env("DSH_TAURI_SHUTDOWN_TOKEN", &token)
-        .spawn()?;
+        .env("DSH_TAURI_SHUTDOWN_TOKEN", &token);
+    if let Some((name, value)) = sharp_library_path(&dsh_dir) {
+        command = command.env(&name, &value);
+    }
+    let (rx, child) = command.spawn()?;
 
     let log_dir = match app.path().home_dir() {
         Ok(home) => home.join(".dsh").join("logs"),
