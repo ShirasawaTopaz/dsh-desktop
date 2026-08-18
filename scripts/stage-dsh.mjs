@@ -6,8 +6,10 @@
  *      staging tree, pinning the whole `@deepseek-ai/dsh-*` family to that
  *      version through npm `overrides` (two passes: install, read the lockfile
  *      for the family member list, then reinstall with the complete override
- *      set), drop musl-only native addons on glibc Linux, and copy the result
- *      into `resources/dsh/`.
+ *      set), drop musl-only native addons on glibc Linux, prune runtime fat
+ *      (debug symbols, source maps, declarations, docs, foreign-platform
+ *      prebuilds and sharp variants), and copy the result into
+ *      `resources/dsh/`.
  *   2. Download the pinned official Node.js runtime for the current platform
  *      and place it under `src-tauri/binaries/` with the Tauri sidecar naming
  *      convention (`node-<target-triple>[.exe]`), unless `--system-node` is
@@ -26,9 +28,9 @@
 
 import { spawnSync } from 'node:child_process'
 import {
-  chmodSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync,
+  chmodSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync,
 } from 'node:fs'
-import { dirname, join, relative } from 'node:path'
+import { basename, dirname, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 /**
@@ -142,6 +144,136 @@ function pruneMuslNativeAddons(root) {
   }
   console.log(`stage-dsh: pruned ${String(removed.length)} musl native addon path(s) (glibc runtime)`)
   for (const path of removed) console.log(`  - ${path}`)
+}
+
+/**
+ * Runtime-fat pruning. The vendored tree only ever executes through
+ * `node lib/bin.js`; the assets below are dead weight in a shipped desktop
+ * build and dropping them roughly halves the payload (and the file count,
+ * which is its own win for install time and antivirus scanning):
+ *
+ *   - Windows debug symbols (`.pdb`, node-pty alone ships ~53 MB);
+ *   - source maps (`.map`) and TypeScript declarations (`.d.ts/.d.mts/.d.cts`)
+ *     — dev-time assets the Node runtime never loads;
+ *   - C++ sources/headers shipped inside native-addon packages;
+ *   - prose docs (`.md`), keeping NOTICE/LICENSE/COPYING for compliance;
+ *   - `prebuilds/<tag>/` dirs whose tag does not match this build's
+ *     `<platform>-<arch>` (e.g. win32-arm64 prebuilds inside an x64 build);
+ *   - `@img/sharp-*` platform packages other than this build's — the wasm
+ *     fallback only ever loads when no native build exists.
+ *
+ * Deliberately NOT touched: non-declaration `.ts`/`.mts` (some packages ship
+ * runtime TS sources, including @deepseek-ai/cordis), `.node`/`.dll`/`.exe`
+ * native binaries, `package.json`/lockfiles, and LICENSE files of any shape.
+ */
+const FAT_EXTENSIONS = new Set(['.pdb', '.map', '.cc', '.cpp', '.h', '.hh'])
+const DECLARATION_RE = /\.d\.[cm]?ts$/i
+const DOC_RE = /\.md$/i
+const LEGAL_RE = /(?:NOTICE|LICEN[CS]E|COPYING)/i
+
+/** The @img platform package that must survive for each build target. */
+const SHARP_NATIVE_PACKAGE = {
+  'win32-x64': 'sharp-win32-x64',
+  'win32-arm64': 'sharp-win32-arm64',
+  'darwin-arm64': 'sharp-darwin-arm64',
+  'darwin-x64': 'sharp-darwin-x64',
+  'linux-x64': 'sharp-linux-x64',
+  'linux-arm64': 'sharp-linux-arm64',
+}
+
+function pruneRuntimeFat(root, platformKey) {
+  const keepPrebuildTag = platformKey
+  const keepSharp = SHARP_NATIVE_PACKAGE[platformKey]
+  let removedFiles = 0
+  let removedBytes = 0
+  const removedDirs = []
+
+  function extOf(name) {
+    const dot = name.lastIndexOf('.')
+    return dot > 0 ? name.slice(dot).toLowerCase() : ''
+  }
+
+  function isFatFile(name) {
+    if (FAT_EXTENSIONS.has(extOf(name))) return true
+    if (DECLARATION_RE.test(name)) return true
+    if (DOC_RE.test(name) && !LEGAL_RE.test(name)) return true
+    return false
+  }
+
+  function dirSize(dir) {
+    let total = 0
+    let count = 0
+    function walkDir(path) {
+      for (const entry of readdirSync(path, { withFileTypes: true })) {
+        const full = join(path, entry.name)
+        if (entry.isDirectory()) walkDir(full)
+        else if (entry.isFile()) {
+          try {
+            total += statSync(full).size
+            count += 1
+          } catch { /* unstatistable files are still removed */ }
+        }
+      }
+    }
+    try {
+      walkDir(dir)
+    } catch {
+      /* unreadable trees are still removed wholesale */
+    }
+    return { total, count }
+  }
+
+  function removeDir(full) {
+    const { total, count } = dirSize(full)
+    removedFiles += count
+    removedBytes += total
+    rmSync(full, { recursive: true, force: true })
+  }
+
+  function walk(dir) {
+    let entries
+    try {
+      entries = readdirSync(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    const parent = basename(dir)
+    const inSharpScope = parent === '@img'
+    for (const entry of entries) {
+      const full = join(dir, entry.name)
+      if (entry.isDirectory()) {
+        // Foreign native prebuilds (node-pty and friends tag dirs with the
+        // runtime pair, e.g. prebuilds/win32-x64).
+        if (parent === 'prebuilds' && !entry.name.startsWith(keepPrebuildTag)) {
+          removedDirs.push(relative(root, full).replaceAll('\\', '/'))
+          removeDir(full)
+          continue
+        }
+        // @img ships one package per platform plus a wasm fallback; only the
+        // native package for this build can ever be selected at runtime.
+        if (inSharpScope && /^sharp-/.test(entry.name) && entry.name !== keepSharp) {
+          removedDirs.push(`@img/${entry.name}`)
+          removeDir(full)
+          continue
+        }
+        walk(full)
+      } else if (entry.isFile() && isFatFile(entry.name)) {
+        let size = 0
+        try {
+          size = statSync(full).size
+        } catch { /* unstatistable files still get removed */ }
+        removedFiles += 1
+        removedBytes += size
+        rmSync(full, { force: true })
+      }
+    }
+  }
+
+  walk(root)
+  console.log(
+    `stage-dsh: pruned runtime fat for ${platformKey}: ${String(removedFiles)} file(s) / `
+    + `${(removedBytes / 1e6).toFixed(1)} MB${removedDirs.length > 0 ? `, dirs: ${removedDirs.join(', ')}` : ''}`,
+  )
 }
 
 /** Assert every installed @deepseek-ai/dsh-* package sits on the exact version. */
@@ -264,6 +396,7 @@ async function main() {
   if (process.platform === 'linux') {
     pruneMuslNativeAddons(join(stagingDir, 'node_modules'))
   }
+  pruneRuntimeFat(join(stagingDir, 'node_modules'), key)
 
   // Assemble resources/dsh (the sidecar working directory at runtime).
   rmSync(resourcesDsh, { recursive: true, force: true })

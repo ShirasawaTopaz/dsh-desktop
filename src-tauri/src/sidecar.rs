@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -34,6 +34,34 @@ pub(crate) const READINESS_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const SHUTDOWN_ROUTE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Grace after a successful route request before the kill fallback.
 pub(crate) const GRACE_AFTER_ROUTE: Duration = Duration::from_secs(8);
+/// Wrapper logs older than this are deleted at launch (best effort).
+const LOG_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Whether a log filename belongs to this wrapper (the `~/.dsh/logs` dir is
+/// shared with the dsh CLI, which writes its own files there).
+fn is_wrapper_log(name: &str) -> bool {
+    name.starts_with("dsh-desktop-") && name.ends_with(".log")
+}
+
+/// Delete stale wrapper logs past [`LOG_RETENTION`]. Failures are ignored:
+/// log pruning must never block startup.
+fn prune_old_logs(log_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(log_dir) else {
+        return;
+    };
+    let cutoff = SystemTime::now().checked_sub(LOG_RETENTION).unwrap_or(SystemTime::UNIX_EPOCH);
+    for entry in entries.flatten() {
+        if !is_wrapper_log(&entry.file_name().to_string_lossy()) {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) else {
+            continue;
+        };
+        if modified < cutoff {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
 
 fn append_log(path: &Path, line: &str) {
     let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
@@ -179,6 +207,7 @@ pub fn spawn(
         Err(_) => config_dir.join("logs"),
     };
     create_dir_all(&log_dir)?;
+    prune_old_logs(&log_dir);
     let log_path = log_dir.join(format!("dsh-desktop-{}.log", std::process::id()));
 
     let pump_log = log_path.clone();
@@ -270,6 +299,27 @@ mod tests {
         ];
         for url in blocked {
             assert!(!is_allowed_navigation(&Url::parse(url).unwrap()), "{url}");
+        }
+    }
+
+    #[test]
+    fn log_pruning_matches_only_wrapper_logs() {
+        let matches = [
+            "dsh-desktop-1234.log",
+            "dsh-desktop-0.log",
+        ];
+        for name in matches {
+            assert!(is_wrapper_log(name), "{name}");
+        }
+        let foreign = [
+            "dsh-web.log",
+            "dsh-desktop-1234.log.bak",
+            "desktop-1234.log",
+            "cordis.log",
+            "README",
+        ];
+        for name in foreign {
+            assert!(!is_wrapper_log(name), "{name}");
         }
     }
 

@@ -10,12 +10,12 @@ WebView ──加载──> http://127.0.0.1:<随机端口>  (dsh web 本地服�
    └────────── Rust 壳 ──sidecar──> node lib/bin.js --profile web --host 127.0.0.1 --port 0
 ```
 
-- **运行负载**:CI 以 `npm install @deepseek-ai/dsh@<版本>` 组装(整个 `@deepseek-ai/dsh-*` 家族通过 npm `overrides` 钉死到同一版本),嵌入 `resources/dsh`。
+- **运行负载**:CI 以 `npm install @deepseek-ai/dsh@<版本>` 组装(整个 `@deepseek-ai/dsh-*` 家族通过 npm `overrides` 钉死到同一版本),裁剪运行时无用文件(Windows `.pdb` 调试符号、sourcemap、`.d.ts` 类型声明、文档、异平台 prebuilds 与 sharp 变体,实测约 -135MB/-54%),嵌入 `resources/dsh`。
 - **Node 运行时**:官方二进制(版本固定于工作流 `NODE_RUNTIME_VERSION`,须满足 dsh 的 engines `^22.19 || >=24`),按 Tauri sidecar 约定命名后嵌入。
 - **就绪契约**:Rust 壳解析 sidecar stdout 的 `dsh web: http://127.0.0.1:<port>` 就绪行,再导航 WebView;`--port 0` 由系统分配端口。
 - **优雅关停**:关窗/退出时先 `POST /api/tauri/shutdown`(每启动随机 token 鉴权),走 dsh 自身的有界 dispose;失败则回退 kill。关停桥与设置页「关于」同属 wrapper 自有的 `dsh-desktop` 插件(源码在 `plugins/dsh-desktop/`,由 `npm run stage` 组装进负载树,经启动时生成的 `--patch` 覆盖层以裸名注入)。
 - **设置页「关于」**:同一插件在 dsh Web 设置页新增「关于」页:显示当前 dsh 版本 / Node 运行时 / 平台架构,并提供手动「检查更新」「下载并安装」按钮,走与自动更新相同的 GitHub Release + minisign 验签通道,进度与结果在页面内呈现。
-- **数据目录**:沿用 `~/.dsh`,与 dsh CLI 互通会话、配置与凭据。日志在 `~/.dsh/logs/dsh-desktop-*.log`。
+- **数据目录**:沿用 `~/.dsh`,与 dsh CLI 互通会话、配置与凭据。日志在 `~/.dsh/logs/dsh-desktop-*.log`,启动时自动清理 7 天前的旧日志(仅匹配 wrapper 自有前缀,不影响 dsh CLI 日志)。
 - **单实例**:二次启动聚焦已有窗口,避免两个进程并发写同一会话存储。
 
 ## 本地构建
@@ -55,4 +55,4 @@ cd src-tauri && npx --yes @tauri-apps/cli@^2 build
 
 - 会话导出等浏览器下载行为在 WebView 中的表现需按平台验证;如有问题将改用 Tauri 下载事件落地文件(二期)。
 - `dsh plugin`(pnpm 插件管理)不在桌面版暴露;可编辑 `~/.dsh/profiles/web/cordis.patch.yml`,配置热重载。
-- 安装体积约 150–250MB(Node 运行时 + npm 依赖树)。
+- 安装体积:安装后约 200MB(Node 运行时 86MB + 裁剪后依赖树约 119MB/1.5 万文件;安装包经 NSIS 压缩后更小)。不打包 Node 的方案(依赖系统 Node / 首启下载)均因可靠性或离线可用性被否,详见 `scripts/stage-dsh.mjs` 的裁剪说明。
