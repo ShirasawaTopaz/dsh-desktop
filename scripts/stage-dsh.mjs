@@ -6,10 +6,14 @@
  *      staging tree, pinning the whole `@deepseek-ai/dsh-*` family to that
  *      version through npm `overrides` (two passes: install, read the lockfile
  *      for the family member list, then reinstall with the complete override
- *      set), drop musl-only native addons on glibc Linux, prune runtime fat
- *      (debug symbols, source maps, declarations, docs, foreign-platform
- *      prebuilds), wire sharp's libvips shared library into every baked
- *      rpath, and copy the result into `resources/dsh/`.
+ *      set). Direct dependency specifiers are saved exact so they match the
+ *      overrides (npm 11 otherwise writes `^` and a later `npm install` into
+ *      the same prefix throws EOVERRIDE). Drop musl-only native addons on
+ *      glibc Linux, prune runtime fat (debug symbols, source maps,
+ *      declarations, docs, foreign-platform prebuilds), fetch this platform's
+ *      sharp native addon (and libvips on Darwin/Linux) in an isolated prefix
+ *      that has no overrides, wire sharp's libvips shared library into every
+ *      baked rpath, and copy the result into `resources/dsh/`.
  *   2. Download the pinned official Node.js runtime for the current platform
  *      and place it under `src-tauri/binaries/` with the Tauri sidecar naming
  *      convention (`node-<target-triple>[.exe]`), unless `--system-node` is
@@ -452,36 +456,92 @@ function materializeAtImg(root) {
   }
 }
 
+function writeStagingManifest(manifestPath, version, family) {
+  writeFileSync(manifestPath, JSON.stringify({
+    name: 'dsh-desktop-staging',
+    private: true,
+    version: '0.0.0',
+    dependencies: { '@deepseek-ai/dsh': version },
+    overrides: Object.fromEntries(family.map(name => [name, version])),
+  }, undefined, 2) + '\n')
+}
+
+function readPackageManifest(nodeModules, name) {
+  const parts = name.split('/')
+  const hoisted = join(nodeModules, ...parts, 'package.json')
+  if (existsSync(hoisted)) return JSON.parse(readFileSync(hoisted, 'utf8'))
+  function walk(dir, depth) {
+    if (depth > 10) return null
+    let entries
+    try {
+      entries = readdirSync(dir, { withFileTypes: true })
+    } catch {
+      return null
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue
+      const full = join(dir, entry.name)
+      if (entry.name === 'node_modules') {
+        const nested = join(full, ...parts, 'package.json')
+        if (existsSync(nested)) return JSON.parse(readFileSync(nested, 'utf8'))
+        const found = walk(full, depth + 1)
+        if (found) return found
+      } else if (entry.name.startsWith('@')) {
+        const found = walk(full, depth + 1)
+        if (found) return found
+      }
+    }
+    return null
+  }
+  return walk(nodeModules, 0)
+}
+
+function sharpPlatformSpecs(nodeModules, platformKey) {
+  const names = [`@img/sharp-${platformKey}`]
+  if (!platformKey.startsWith('win32')) names.push(`@img/sharp-libvips-${platformKey}`)
+  const sharp = readPackageManifest(nodeModules, 'sharp')
+  const optional = sharp?.optionalDependencies ?? {}
+  return names.map(name => (optional[name] !== undefined ? `${name}@${optional[name]}` : name))
+}
+
 /**
- * Fetch this platform's sharp addon + libvips via `npm pack` into an isolated
- * directory (not the staging prefix). A second `npm install` into staging
- * hits EOVERRIDE because staging's package.json pins `@deepseek-ai/dsh`
- * through `overrides`. The tarball extract is a real copy, not a symlink.
+ * Fetch this platform's sharp addon + libvips in an isolated prefix that has
+ * no `overrides`. A second `npm install` into staging hits EOVERRIDE on npm 11
+ * when the direct `@deepseek-ai/dsh` specifier is `^x.y.z` but the override
+ * pins the exact version. Copy the resulting `@img/*` trees in as real files.
  */
-function packSharpPlatformPackages(nodeModules, cacheDir, platformKey, npm) {
-  const pkgs = [`@img/sharp-${platformKey}`]
-  if (!platformKey.startsWith('win32')) pkgs.push(`@img/sharp-libvips-${platformKey}`)
-  const tmp = join(dirname(nodeModules), '.sharp-pack')
+function installSharpPlatformPackages(nodeModules, cacheDir, platformKey, npm) {
+  const pkgs = sharpPlatformSpecs(nodeModules, platformKey)
+  const tmp = join(dirname(nodeModules), '.sharp-install')
   rmSync(tmp, { recursive: true, force: true })
   mkdirSync(tmp, { recursive: true })
-  for (const pkg of pkgs) {
-    console.log(`stage-dsh: npm pack ${pkg}`)
-    run(npm.cmd, [...npm.base, 'pack', pkg, '--pack-destination', tmp, '--cache', cacheDir])
-  }
+  writeFileSync(join(tmp, 'package.json'), JSON.stringify({
+    name: 'dsh-desktop-sharp',
+    private: true,
+    version: '0.0.0',
+  }, undefined, 2) + '\n')
+  const dash = platformKey.indexOf('-')
+  const os = platformKey.slice(0, dash)
+  const cpu = platformKey.slice(dash + 1)
+  console.log(`stage-dsh: installing ${pkgs.join(', ')} for ${os}/${cpu} (isolated prefix)`)
+  run(npm.cmd, [
+    ...npm.base,
+    'install', '--prefix', tmp, '--no-audit', '--no-fund',
+    '--include=optional', `--os=${os}`, `--cpu=${cpu}`,
+    '--cache', cacheDir, ...pkgs,
+  ])
+  const srcImg = join(tmp, 'node_modules', '@img')
   const destImg = join(nodeModules, '@img')
+  if (!existsSync(srcImg)) {
+    console.error(`stage-dsh: isolated sharp install produced no ${srcImg}`)
+    process.exit(1)
+  }
   mkdirSync(destImg, { recursive: true })
-  for (const name of readdirSync(tmp)) {
-    if (!name.endsWith('.tgz')) continue
-    const extractDir = join(tmp, name.slice(0, -4))
-    mkdirSync(extractDir, { recursive: true })
-    run('tar', ['-xf', join(tmp, name), '-C', extractDir])
-    const packed = join(extractDir, 'package')
-    const manifest = JSON.parse(readFileSync(join(packed, 'package.json'), 'utf8'))
-    const folder = String(manifest.name).split('/').pop()
-    const dest = join(destImg, folder)
+  for (const name of readdirSync(srcImg)) {
+    const dest = join(destImg, name)
     rmSync(dest, { recursive: true, force: true })
-    cpSync(packed, dest, { recursive: true })
-    console.log(`stage-dsh: unpacked ${manifest.name}@${manifest.version} -> @img/${folder}`)
+    cpSync(join(srcImg, name), dest, { recursive: true, dereference: true })
+    console.log(`stage-dsh: copied @img/${name}`)
   }
   rmSync(tmp, { recursive: true, force: true })
 }
@@ -646,17 +706,15 @@ async function main() {
   mkdirSync(cacheDir, { recursive: true })
 
   // Pass 1: install the exact root package so the lockfile reveals the family.
+  // `--save-exact` keeps the direct specifier identical to the override; npm 11
+  // otherwise writes `^version` and any later install into this prefix fails
+  // with EOVERRIDE ("conflicts with direct dependency").
   const manifestPath = join(stagingDir, 'package.json')
-  writeFileSync(manifestPath, JSON.stringify({
-    name: 'dsh-desktop-staging',
-    private: true,
-    version: '0.0.0',
-    overrides: { '@deepseek-ai/dsh': version },
-  }, undefined, 2) + '\n')
+  writeStagingManifest(manifestPath, version, ['@deepseek-ai/dsh'])
 
   const installArgs = [
-    'install', '--prefix', stagingDir, '--no-audit', '--no-fund',
-    '--cache', cacheDir, `@deepseek-ai/dsh@${version}`,
+    'install', '--prefix', stagingDir, '--no-audit', '--no-fund', '--save-exact',
+    '--cache', cacheDir,
   ]
   const npm = npmInvocation()
   run(npm.cmd, [...npm.base, ...installArgs])
@@ -666,16 +724,10 @@ async function main() {
   // release numbers).
   const lockPath = join(stagingDir, 'package-lock.json')
   const family = dshFamilyFromLock(lockPath)
-  const overrides = Object.fromEntries(family.map(name => [name, version]))
-  writeFileSync(manifestPath, JSON.stringify({
-    name: 'dsh-desktop-staging',
-    private: true,
-    version: '0.0.0',
-    overrides,
-  }, undefined, 2) + '\n')
+  writeStagingManifest(manifestPath, version, family)
   run(npm.cmd, [...npm.base, ...installArgs])
   verifyFamilyVersion(lockPath, version)
-  packSharpPlatformPackages(join(stagingDir, 'node_modules'), cacheDir, key, npm)
+  installSharpPlatformPackages(join(stagingDir, 'node_modules'), cacheDir, key, npm)
   if (process.platform === 'linux') {
     pruneMuslNativeAddons(join(stagingDir, 'node_modules'))
   }
