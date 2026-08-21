@@ -42,6 +42,9 @@ env:
   # Exact Node runtime embedded as the sidecar; must satisfy dsh's engines
   # (^22.19.0 || >=24.0.0). Bump deliberately, in lockstep with the workflow.
   NODE_RUNTIME_VERSION: '24.13.0'
+  # macos-14 runners have 7 GiB; V8's default ~2 GiB heap OOMs arborist while
+  # staging @deepseek-ai/dsh. 4 GiB fits with headroom for native buffers.
+  NODE_OPTIONS: --max-old-space-size=4096
 
 jobs:
   detect:

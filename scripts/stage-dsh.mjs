@@ -69,10 +69,29 @@ function usage() {
   process.exit(2)
 }
 
+/**
+ * V8's default old-space is ~2 GiB when it cannot size itself from RAM (GitHub
+ * macos-14 runners are 7 GiB and hit this). arborist on the dsh tree exceeds
+ * that; raising the cap is a limit, not a reservation.
+ */
+const NODE_HEAP_MB = 4096
+
+function withMaxOldSpace(existing, mb) {
+  const current = existing ?? ''
+  if (/(?:^|\s)--max[-_]old[-_]space[-_]size=/.test(current)) return current
+  const flag = `--max-old-space-size=${String(mb)}`
+  return current.trim() === '' ? flag : `${current.trim()} ${flag}`
+}
+
 function run(cmd, args, opts = {}) {
-  const result = spawnSync(cmd, args, { stdio: 'inherit', ...opts })
+  const env = { ...process.env, ...(opts.env ?? {}) }
+  env.NODE_OPTIONS = withMaxOldSpace(env.NODE_OPTIONS, NODE_HEAP_MB)
+  const result = spawnSync(cmd, args, { stdio: 'inherit', ...opts, env })
   if (result.status !== 0) {
-    console.error(`stage-dsh: ${cmd} ${args.join(' ')} failed (exit ${String(result.status)})`)
+    const detail = result.signal != null
+      ? `signal ${result.signal}`
+      : `exit ${String(result.status)}`
+    console.error(`stage-dsh: ${cmd} ${args.join(' ')} failed (${detail})`)
     process.exit(1)
   }
 }
