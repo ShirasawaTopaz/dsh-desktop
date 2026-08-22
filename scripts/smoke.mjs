@@ -6,7 +6,7 @@
  * runtime contract:
  *
  *   1. the readiness line `dsh web: http://127.0.0.1:<port>` appears on stdout;
- *   2. `GET /` serves the injected `window.__DSH_BOOT__` boot graph;
+ *   2. `GET /` serves the injected `__DSH_BOOT__` boot graph global;
  *   3. a module row URL from the boot graph serves its client bundle;
  *   4. the dsh-desktop plugin is composed: its boot-graph row serves the
  *      client bundle, `GET /api/tauri/version` answers with the payload
@@ -27,6 +27,19 @@ import { fileURLToPath } from 'node:url'
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url))
 const READINESS_RE = /dsh web: http:\/\/127\.0\.0\.1:(\d+)/
+const TAIL_BYTES = 8000
+
+/**
+ * Rolling captures of the child's streams and the last served index HTML.
+ * Every failure dumps them: a boot-graph failure is meaningless without the
+ * dsh process's own account of what failed to load (a failed plugin fiber is
+ * logged on stderr, which CI would otherwise never show).
+ */
+const capture = { stdout: '', stderr: '', indexHtml: '' }
+
+function captureChunk(kind, chunk) {
+  capture[kind] = (capture[kind] + String(chunk)).slice(-TAIL_BYTES)
+}
 
 /** Default node binary: the staged sidecar (from version.json), else system node. */
 function defaultNode() {
@@ -137,6 +150,14 @@ function waitForReadiness(child, regex, timeoutMs) {
 
 function fail(message) {
   console.error(`smoke: FAIL — ${message}`)
+  console.error('smoke: --- dsh stdout tail ---')
+  console.error(capture.stdout === '' ? '(empty)' : capture.stdout)
+  console.error('smoke: --- dsh stderr tail ---')
+  console.error(capture.stderr === '' ? '(empty)' : capture.stderr)
+  if (capture.indexHtml !== '') {
+    console.error(`smoke: --- GET / body head (${String(capture.indexHtml.length)} bytes total) ---`)
+    console.error(capture.indexHtml.slice(0, 1200))
+  }
   process.exit(1)
 }
 
@@ -153,6 +174,8 @@ async function main() {
     '- insert:',
     '    - id: dsh-desktop',
     "      name: 'dsh-desktop'",
+    '    - id: dsh-computer-use',
+    "      name: 'dsh-computer-use'",
     '',
   ].join('\n'))
 
@@ -170,6 +193,10 @@ async function main() {
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
+  // Keep the full-run tails for failure diagnostics (waitForReadiness has its
+  // own listeners; both can coexist on the same streams).
+  child.stdout.on('data', chunk => captureChunk('stdout', chunk))
+  child.stderr.on('data', chunk => captureChunk('stderr', chunk))
 
   let port
   try {
@@ -181,18 +208,25 @@ async function main() {
 
   const index = await fetch(`http://127.0.0.1:${port}/`)
   const html = await index.text()
-  if (index.status !== 200 || !html.includes('window.__DSH_BOOT__')) {
-    fail(`GET / status ${index.status}, __DSH_BOOT__ injection missing`)
+  capture.indexHtml = html
+  // Upstream renders the boot graph global in more than one spelling over
+  // time (≤0.1.0-rc.8: `window.__DSH_BOOT__ = …`; ≥0.1.1-rc.1: a structured
+  // injection row rendered as `globalThis["__DSH_BOOT__"] = …`). The runtime
+  // contract is the global NAME plus a parseable graph, not one spelling.
+  if (index.status !== 200 || !html.includes('__DSH_BOOT__')) {
+    fail(`GET / status ${index.status}, __DSH_BOOT__ injection missing (body ${String(html.length)} bytes)`)
   }
-  console.log('smoke: index serves window.__DSH_BOOT__')
+  console.log('smoke: index serves the __DSH_BOOT__ global')
 
   // Fetch one module row from the boot graph to prove client bundles serve.
-  // The injected script is `window.__DSH_BOOT__ = {...}</script>`; extract
-  // tolerantly (the JSON may carry a trailing dot/space before the tag).
-  const marker = 'window.__DSH_BOOT__ = '
-  const at = html.indexOf(marker)
-  if (at === -1) fail('boot graph script tag not found')
-  let raw = html.slice(at + marker.length)
+  // The injected script is `<global>__DSH_BOOT__… = {...}</script>`; locate it
+  // tolerantly: first occurrence of the name, then its assignment `=` (the
+  // JSON escapes `<`, so the first `</script>` after the `=` ends the tag).
+  const nameAt = html.indexOf('__DSH_BOOT__')
+  if (nameAt === -1) fail('boot graph script tag not found')
+  const eqAt = html.indexOf('=', nameAt)
+  if (eqAt === -1) fail('boot graph assignment not found')
+  let raw = html.slice(eqAt + 1)
   const scriptEnd = raw.indexOf('</script>')
   if (scriptEnd !== -1) raw = raw.slice(0, scriptEnd)
   const cut = raw.lastIndexOf('}')
@@ -225,6 +259,20 @@ async function main() {
     fail(`dsh-desktop bundle GET ${wrapperRow.url} status ${wrapperBundle.status}`)
   }
   console.log('smoke: dsh-desktop client plugin composed and served')
+
+  // The computer-use plugin's diagnostics route must answer on loopback with
+  // the platform availability payload (proves the second wrapper row loads).
+  const computerUse = await fetch(`http://127.0.0.1:${port}/api/computer-use/status`)
+  const computerUseBody = await computerUse.json()
+  if (
+    computerUse.status !== 200
+    || computerUseBody.plugin !== 'dsh-computer-use'
+    || computerUseBody.platform !== process.platform
+    || typeof computerUseBody.available !== 'boolean'
+  ) {
+    fail(`computer-use status route status ${computerUse.status}, payload ${JSON.stringify(computerUseBody)}`)
+  }
+  console.log(`smoke: computer-use status answers (available=${String(computerUseBody.available)})`)
 
   // The version route must answer with the wrapper payload to loopback hosts
   // and refuse non-loopback Host headers.
