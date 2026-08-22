@@ -15,6 +15,7 @@ WebView ──加载──> http://127.0.0.1:<随机端口>  (dsh web 本地服�
 - **就绪契约**:Rust 壳解析 sidecar stdout 的 `dsh web: http://127.0.0.1:<port>` 就绪行,再导航 WebView;`--port 0` 由系统分配端口。
 - **优雅关停**:关窗/退出时先 `POST /api/tauri/shutdown`(每启动随机 token 鉴权),走 dsh 自身的有界 dispose;失败则回退 kill。关停桥与设置页「关于」同属 wrapper 自有的 `dsh-desktop` 插件(源码在 `plugins/dsh-desktop/`,由 `npm run stage` 组装进负载树,经启动时生成的 `--patch` 覆盖层以裸名注入)。
 - **设置页「关于」**:同一插件在 dsh Web 设置页新增「关于」页:显示当前 dsh 版本 / Node 运行时 / 平台架构,并提供手动「检查更新」「下载并安装」按钮,走与自动更新相同的 GitHub Release + minisign 验签通道,进度与结果在页面内呈现。
+- **电脑操控(computer-use)**:wrapper 自有的 `dsh-computer-use` 插件(源码在 `plugins/dsh-computer-use/`,与 `dsh-desktop` 同走 stage + `--patch` 注入)为 agent 提供六个桌面工具:`computer_screenshot`(截图,经附件存储以图片块返回)、`computer_click` / `computer_type` / `computer_key` / `computer_scroll` / `computer_drag`(键鼠控制)。实现走 OS 原生通道——Windows 用 PowerShell + SendInput,macOS 用 screencapture + CGEvent/System Events,Linux(X11)用 xdotool 与常见截屏工具;helper 以 JSON-over-stdio 通信,模型字符串不经过任何 shell。默认「仅敏感动作询问」:截图免审批,键鼠动作每次经 dsh 审批流征求用户同意(`approvalMode` 配置可改为 `all` 或 `none`)。环回诊断路由 `GET /api/computer-use/status` 报告平台可用性。
 - **数据目录**:沿用 `~/.dsh`,与 dsh CLI 互通会话、配置与凭据。日志在 `~/.dsh/logs/dsh-desktop-*.log`,启动时自动清理 7 天前的旧日志(仅匹配 wrapper 自有前缀,不影响 dsh CLI 日志)。
 - **单实例**:二次启动聚焦已有窗口,避免两个进程并发写同一会话存储。
 
@@ -54,5 +55,6 @@ cd src-tauri && npx --yes @tauri-apps/cli@^2 build
 ## 已知限制
 
 - 会话导出等浏览器下载行为在 WebView 中的表现需按平台验证;如有问题将改用 Tauri 下载事件落地文件(二期)。
-- `dsh plugin`(pnpm 插件管理)不在桌面版暴露;可编辑 `~/.dsh/profiles/web/cordis.patch.yml`,配置热重载。
+- `dsh plugin`(pnpm 插件管理)不在桌面版暴露;可编辑 `~/.dsh/profiles/web/cordis.patch.yml`,配置热重载(删除 `dsh-computer-use` 行即整体停用电脑操控)。
+- 电脑操控(computer-use):仅主显示器;坐标为截图像素空间,Retina 屏由 helper 内部换算。macOS 需在「系统设置 → 隐私与安全性」授予辅助功能(键鼠)与屏幕录制(截图)权限,未授权时动作报错、截图可能只有壁纸;Linux 仅支持 X11(Wayland 直接拒绝)且需 xdotool;锁屏 / UAC 安全桌面无法注入;插件运行于 sidecar 进程,不受文件沙箱约束——这是触达真实桌面的设计前提,靠审批流约束敏感动作。
 - 安装体积:安装后约 200MB(Node 运行时 86MB + 裁剪后依赖树约 119MB/1.5 万文件;安装包经 NSIS 压缩后更小)。不打包 Node 的方案(依赖系统 Node / 首启下载)均因可靠性或离线可用性被否,详见 `scripts/stage-dsh.mjs` 的裁剪说明。

@@ -1,0 +1,13 @@
+{
+  "name": "dsh-computer-use",
+  "version": "0.0.0",
+  "private": true,
+  "description": "dsh-desktop computer-use plugin: model-facing screenshot and mouse/keyboard tools over OS-native helpers (PowerShell on Windows, screencapture+JXA on macOS, scrot/maim+xdotool on Linux X11), gated through ctx.approval for mutating actions.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "license": "MIT"
+}

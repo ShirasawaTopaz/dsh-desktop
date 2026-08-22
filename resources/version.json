@@ -1,5 +1,5 @@
 {
-  "version": "0.1.0-rc.6",
+  "version": "0.1.1-rc.2",
   "nodeVersion": "24.13.0",
   "target": "x86_64-pc-windows-msvc",
   "platform": "win32",

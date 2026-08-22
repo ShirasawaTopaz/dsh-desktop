@@ -38,16 +38,20 @@ import { basename, dirname, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 /**
- * Wrapper-owned plugin injected into the staged tree (shutdown bridge +
- * Settings → About page). The plugin package ships from `plugins/dsh-desktop/`
- * and is copied into the staged `node_modules`; the vendored `@deepseek-ai/dsh`
- * manifest additionally declares it as a dependency so dsh's profile module
- * fallback symlinks it into `~/.dsh/profiles/node_modules`, which is what
- * makes the bare-name loader row and the browser client-modules resolution
- * both work at runtime.
+ * Wrapper-owned plugins injected into the staged tree. Each package ships
+ * from `plugins/<name>/` and is copied into the staged `node_modules`; the
+ * vendored `@deepseek-ai/dsh` manifest additionally declares each as a
+ * dependency so dsh's profile module fallback symlinks it into
+ * `~/.dsh/profiles/node_modules`, which is what makes the bare-name loader
+ * rows and the browser client-modules resolution work at runtime.
+ *
+ * dsh-desktop: shutdown bridge + Settings → About page.
+ * dsh-computer-use: screenshot + mouse/keyboard agent tools.
  */
-const WRAPPER_PLUGIN_PACKAGE = 'dsh-desktop'
-const WRAPPER_PLUGIN_VERSION = '0.0.0'
+const WRAPPER_PLUGINS = [
+  { name: 'dsh-desktop', version: '0.0.0' },
+  { name: 'dsh-computer-use', version: '0.0.0' },
+]
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url))
 const NODE_DIST_BASE = 'https://nodejs.org/dist'
@@ -663,49 +667,51 @@ function verifyFamilyVersion(lockPath, version) {
 }
 
 /**
- * Inject the wrapper-owned dsh-desktop plugin into the assembled payload:
- * copy the package into the staged `node_modules` and declare it as a
- * dependency of the vendored `@deepseek-ai/dsh` manifest. The manifest entry
- * is what makes `healProfilesModuleFallback` symlink the package into the
- * profile's module fallback dir at boot, which both the loader (bare-name row
- * `dsh-desktop`) and the browser client-modules resolution depend on.
+ * Inject the wrapper-owned plugins into the assembled payload: copy each
+ * package into the staged `node_modules` and declare it as a dependency of
+ * the vendored `@deepseek-ai/dsh` manifest. The manifest entries are what
+ * make `healProfilesModuleFallback` symlink the packages into the profile's
+ * module fallback dir at boot, which both the loader (bare-name rows) and
+ * the browser client-modules resolution depend on.
  *
  * The vendored manifest is regenerated on every stage (fresh npm install), so
  * this patch is applied per stage and never drifts across releases.
  */
-function injectWrapperPlugin(resourcesDsh) {
-  const source = join(ROOT, 'plugins', WRAPPER_PLUGIN_PACKAGE)
-  const dest = join(resourcesDsh, 'node_modules', WRAPPER_PLUGIN_PACKAGE)
-  if (!existsSync(join(source, 'package.json'))) {
-    console.error(`stage-dsh: wrapper plugin missing at ${source}`)
-    process.exit(1)
-  }
-  rmSync(dest, { recursive: true, force: true })
-  cpSync(source, dest, { recursive: true })
-
+function injectWrapperPlugins(resourcesDsh) {
   const appManifestPath = join(resourcesDsh, 'node_modules', '@deepseek-ai', 'dsh', 'package.json')
-  const appManifest = JSON.parse(readFileSync(appManifestPath, 'utf8'))
-  const dependencies = appManifest.dependencies ?? {}
-  if (dependencies[WRAPPER_PLUGIN_PACKAGE] === undefined) {
-    dependencies[WRAPPER_PLUGIN_PACKAGE] = WRAPPER_PLUGIN_VERSION
-    appManifest.dependencies = Object.fromEntries(
-      Object.entries(dependencies).sort(([a], [b]) => a.localeCompare(b)),
-    )
-    writeFileSync(appManifestPath, JSON.stringify(appManifest, undefined, 2) + '\n')
-  }
+  for (const plugin of WRAPPER_PLUGINS) {
+    const source = join(ROOT, 'plugins', plugin.name)
+    const dest = join(resourcesDsh, 'node_modules', plugin.name)
+    if (!existsSync(join(source, 'package.json'))) {
+      console.error(`stage-dsh: wrapper plugin missing at ${source}`)
+      process.exit(1)
+    }
+    rmSync(dest, { recursive: true, force: true })
+    cpSync(source, dest, { recursive: true })
 
-  // Verify both post-conditions fail loud (mirrors verifyFamilyVersion).
-  const packaged = join(dest, 'package.json')
-  if (!existsSync(packaged)) {
-    console.error(`stage-dsh: wrapper plugin not staged at ${packaged}`)
-    process.exit(1)
+    const appManifest = JSON.parse(readFileSync(appManifestPath, 'utf8'))
+    const dependencies = appManifest.dependencies ?? {}
+    if (dependencies[plugin.name] === undefined) {
+      dependencies[plugin.name] = plugin.version
+      appManifest.dependencies = Object.fromEntries(
+        Object.entries(dependencies).sort(([a], [b]) => a.localeCompare(b)),
+      )
+      writeFileSync(appManifestPath, JSON.stringify(appManifest, undefined, 2) + '\n')
+    }
+
+    // Verify both post-conditions fail loud (mirrors verifyFamilyVersion).
+    const packaged = join(dest, 'package.json')
+    if (!existsSync(packaged)) {
+      console.error(`stage-dsh: wrapper plugin not staged at ${packaged}`)
+      process.exit(1)
+    }
+    const patched = JSON.parse(readFileSync(appManifestPath, 'utf8'))
+    if (patched.dependencies?.[plugin.name] !== plugin.version) {
+      console.error(`stage-dsh: vendored dsh manifest missing the ${plugin.name} dependency`)
+      process.exit(1)
+    }
+    console.log(`stage-dsh: wrapper plugin ${plugin.name} staged`)
   }
-  const patched = JSON.parse(readFileSync(appManifestPath, 'utf8'))
-  if (patched.dependencies?.[WRAPPER_PLUGIN_PACKAGE] !== WRAPPER_PLUGIN_VERSION) {
-    console.error('stage-dsh: vendored dsh manifest missing the dsh-desktop dependency')
-    process.exit(1)
-  }
-  console.log(`stage-dsh: wrapper plugin ${WRAPPER_PLUGIN_PACKAGE} staged`)
 }
 
 async function main() {
@@ -771,7 +777,7 @@ async function main() {
   wireSharpNative(join(resourcesDsh, 'node_modules'), key, resourcesDsh)
   cpSync(manifestPath, join(resourcesDsh, 'package.json'))
   cpSync(lockPath, join(resourcesDsh, 'package-lock.json'))
-  injectWrapperPlugin(resourcesDsh)
+  injectWrapperPlugins(resourcesDsh)
 
   // Node runtime sidecar.
   let nodeVersion = null
